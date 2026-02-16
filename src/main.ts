@@ -3,7 +3,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import Fastify from "fastify";
+import websocket from "@fastify/websocket";
 import env from "./env.js";
+import type { RawData, WebSocket } from "ws";
 
 type PlaybackAction = "play" | "pause" | "seek" | "changeVideo";
 
@@ -41,8 +43,70 @@ type VideoItem = {
   streamPath: string;
 };
 
+type RequestLike = {
+  protocol: string;
+  hostname: string;
+  headers: Record<string, string | string[] | undefined>;
+};
+
+type WsClientMessage =
+  | {
+      type: "playback";
+      action: PlaybackAction;
+      atTimeSec?: number;
+      videoId?: string;
+    }
+  | {
+      type: "chat";
+      message: string;
+    }
+  | {
+      type: "sync";
+    }
+  | {
+      type: "ping";
+    };
+
+type WsServerMessage =
+  | {
+      type: "welcome";
+      room: RoomResponse;
+      messages: ChatMessage[];
+    }
+  | {
+      type: "room_state";
+      room: RoomResponse;
+      reason: "join" | "playback" | "video_change" | "sync";
+      byUserId: string;
+      action?: PlaybackAction;
+    }
+  | {
+      type: "chat_message";
+      message: ChatMessage;
+      revision: number;
+    }
+  | {
+      type: "pong";
+      at: string;
+    }
+  | {
+      type: "error";
+      error: string;
+    };
+
+type RoomResponse = {
+  roomId: string;
+  creatorId: string;
+  inviteToken: string;
+  shareUrl: string;
+  memberCount: number;
+  revision: number;
+  playback: PlaybackState;
+};
+
 const rooms = new Map<string, Room>();
 const chatByRoom = new Map<string, ChatMessage[]>();
+const socketsByRoom = new Map<string, Set<WebSocket>>();
 
 const app = Fastify({ logger: true });
 
@@ -67,11 +131,7 @@ const fromVideoId = (videoId: string): string | null => {
 const streamPathForVideoId = (videoId: string): string =>
   `/videos/${videoId}/stream`;
 
-const getBaseUrl = (request: {
-  protocol: string;
-  hostname: string;
-  headers: Record<string, string | string[] | undefined>;
-}): string => {
+const getBaseUrl = (request: RequestLike): string => {
   if (env.PUBLIC_BASE_URL) {
     return env.PUBLIC_BASE_URL;
   }
@@ -177,22 +237,7 @@ const getVideoById = async (videoId: string): Promise<VideoItem | null> => {
   }
 };
 
-const roomResponse = (
-  room: Room,
-  request: {
-    protocol: string;
-    hostname: string;
-    headers: Record<string, string | string[] | undefined>;
-  },
-): {
-  roomId: string;
-  creatorId: string;
-  inviteToken: string;
-  shareUrl: string;
-  memberCount: number;
-  revision: number;
-  playback: PlaybackState;
-} => {
+const roomResponse = (room: Room, request: RequestLike): RoomResponse => {
   const baseUrl = getBaseUrl(request);
   const shareUrl = `${baseUrl}/room/${room.id}?token=${room.inviteToken}`;
   return {
@@ -205,6 +250,99 @@ const roomResponse = (
     playback: room.playback,
   };
 };
+
+const sendWs = (socket: WebSocket, payload: WsServerMessage): void => {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+  socket.send(JSON.stringify(payload));
+};
+
+const broadcastRoomState = (
+  room: Room,
+  request: RequestLike,
+  byUserId: string,
+  reason: "join" | "playback" | "video_change" | "sync",
+  action?: PlaybackAction,
+): void => {
+  const roomSockets = socketsByRoom.get(room.id);
+  if (!roomSockets || roomSockets.size === 0) {
+    return;
+  }
+
+  const payload: WsServerMessage = {
+    type: "room_state",
+    room: roomResponse(room, request),
+    reason,
+    byUserId,
+    action,
+  };
+
+  for (const socket of roomSockets) {
+    sendWs(socket, payload);
+  }
+};
+
+const applyPlaybackAction = async (
+  room: Room,
+  action: PlaybackAction,
+  atTimeSec?: number,
+  videoId?: string,
+): Promise<{ ok: true } | { ok: false; error: string }> => {
+  const playback = normalizePlayback(room.playback);
+  const currentMs = nowMs();
+
+  if (action === "play") {
+    room.playback = {
+      ...playback,
+      isPlaying: true,
+      lastUpdatedAtMs: currentMs,
+    };
+  }
+
+  if (action === "pause") {
+    room.playback = {
+      ...playback,
+      isPlaying: false,
+      lastUpdatedAtMs: currentMs,
+    };
+  }
+
+  if (action === "seek") {
+    if (typeof atTimeSec !== "number" || atTimeSec < 0) {
+      return { ok: false, error: "invalid_seek_time" };
+    }
+    room.playback = {
+      ...playback,
+      playbackTimeSec: atTimeSec,
+      lastUpdatedAtMs: currentMs,
+    };
+  }
+
+  if (action === "changeVideo") {
+    if (!videoId) {
+      return { ok: false, error: "missing_video_id" };
+    }
+
+    const video = await getVideoById(videoId);
+    if (!video) {
+      return { ok: false, error: "video_not_found" };
+    }
+
+    room.playback = {
+      videoId: video.id,
+      videoUrl: video.streamPath,
+      playbackTimeSec: 0,
+      isPlaying: false,
+      lastUpdatedAtMs: currentMs,
+    };
+  }
+
+  room.revision += 1;
+  return { ok: true };
+};
+
+app.register(websocket);
 
 app.get("/health", async () => ({
   ok: true,
@@ -318,198 +456,139 @@ app.post<{
   return roomResponse(room, request);
 });
 
-app.post<{
+app.get<{
   Params: { roomId: string };
-  Body: {
-    userId: string;
-    inviteToken: string;
+  Querystring: {
+    userId?: string;
+    inviteToken?: string;
   };
-}>("/rooms/:roomId/join", async (request, reply) => {
+}>("/rooms/:roomId/ws", { websocket: true }, (socket, request): void => {
   const { roomId } = request.params;
-  const { userId, inviteToken } = request.body;
-
+  const { userId, inviteToken } = request.query;
   const room = getRoomOr404(roomId);
+
   if (!room) {
-    reply.code(404);
-    return { error: "room_not_found" };
+    sendWs(socket, { type: "error", error: "room_not_found" });
+    socket.close();
+    return;
+  }
+
+  if (!userId) {
+    sendWs(socket, { type: "error", error: "missing_user_id" });
+    socket.close();
+    return;
   }
 
   if (inviteToken !== room.inviteToken) {
-    reply.code(403);
-    return { error: "invalid_invite_token" };
+    sendWs(socket, { type: "error", error: "invalid_invite_token" });
+    socket.close();
+    return;
   }
 
   room.members.add(userId);
   room.playback = normalizePlayback(room.playback);
   room.revision += 1;
 
-  return roomResponse(room, request);
-});
+  const roomSockets = socketsByRoom.get(room.id) ?? new Set<WebSocket>();
+  roomSockets.add(socket);
+  socketsByRoom.set(room.id, roomSockets);
 
-app.get<{
-  Params: { roomId: string };
-}>("/rooms/:roomId/state", async (request, reply) => {
-  const { roomId } = request.params;
-  const room = getRoomOr404(roomId);
+  sendWs(socket, {
+    type: "welcome",
+    room: roomResponse(room, request),
+    messages: chatByRoom.get(room.id) ?? [],
+  });
+  broadcastRoomState(room, request, userId, "join");
 
-  if (!room) {
-    reply.code(404);
-    return { error: "room_not_found" };
-  }
-
-  room.playback = normalizePlayback(room.playback);
-  return roomResponse(room, request);
-});
-
-app.post<{
-  Params: { roomId: string };
-  Body: {
-    userId: string;
-    action: PlaybackAction;
-    atTimeSec?: number;
-    videoId?: string;
-  };
-}>("/rooms/:roomId/playback", async (request, reply) => {
-  const { roomId } = request.params;
-  const { userId, action, atTimeSec, videoId } = request.body;
-  const room = getRoomOr404(roomId);
-
-  if (!room) {
-    reply.code(404);
-    return { error: "room_not_found" };
-  }
-
-  if (!room.members.has(userId)) {
-    reply.code(403);
-    return { error: "user_not_in_room" };
-  }
-
-  const playback = normalizePlayback(room.playback);
-  const currentMs = nowMs();
-
-  if (action === "play") {
-    room.playback = {
-      ...playback,
-      isPlaying: true,
-      lastUpdatedAtMs: currentMs,
-    };
-  }
-
-  if (action === "pause") {
-    room.playback = {
-      ...playback,
-      isPlaying: false,
-      lastUpdatedAtMs: currentMs,
-    };
-  }
-
-  if (action === "seek") {
-    if (typeof atTimeSec !== "number" || atTimeSec < 0) {
-      reply.code(400);
-      return { error: "invalid_seek_time" };
-    }
-    room.playback = {
-      ...playback,
-      playbackTimeSec: atTimeSec,
-      lastUpdatedAtMs: currentMs,
-    };
-  }
-
-  if (action === "changeVideo") {
-    if (!videoId) {
-      reply.code(400);
-      return { error: "missing_video_id" };
+  socket.on("message", async (raw: RawData): Promise<void> => {
+    let payload: WsClientMessage;
+    try {
+      payload = JSON.parse(raw.toString()) as WsClientMessage;
+    } catch {
+      sendWs(socket, { type: "error", error: "invalid_json" });
+      return;
     }
 
-    const video = await getVideoById(videoId);
-    if (!video) {
-      reply.code(404);
-      return { error: "video_not_found" };
+    if (payload.type === "ping") {
+      sendWs(socket, { type: "pong", at: new Date().toISOString() });
+      return;
     }
 
-    room.playback = {
-      videoId: video.id,
-      videoUrl: video.streamPath,
-      playbackTimeSec: 0,
-      isPlaying: false,
-      lastUpdatedAtMs: currentMs,
-    };
-  }
+    if (payload.type === "sync") {
+      room.playback = normalizePlayback(room.playback);
+      room.revision += 1;
+      broadcastRoomState(room, request, userId, "sync");
+      return;
+    }
 
-  room.revision += 1;
+    if (payload.type === "playback") {
+      const result = await applyPlaybackAction(
+        room,
+        payload.action,
+        payload.atTimeSec,
+        payload.videoId,
+      );
 
-  return {
-    roomId: room.id,
-    revision: room.revision,
-    action,
-    byUserId: userId,
-    playback: room.playback,
-  };
-});
+      if (!result.ok) {
+        sendWs(socket, { type: "error", error: result.error });
+        return;
+      }
 
-app.post<{
-  Params: { roomId: string };
-  Body: {
-    userId: string;
-    message: string;
-  };
-}>("/rooms/:roomId/chat", async (request, reply) => {
-  const { roomId } = request.params;
-  const { userId, message } = request.body;
-  const room = getRoomOr404(roomId);
+      const reason =
+        payload.action === "changeVideo" ? "video_change" : "playback";
+      broadcastRoomState(room, request, userId, reason, payload.action);
+      return;
+    }
 
-  if (!room) {
-    reply.code(404);
-    return { error: "room_not_found" };
-  }
+    if (payload.type === "chat") {
+      const trimmed = payload.message.trim();
+      if (!trimmed) {
+        sendWs(socket, { type: "error", error: "message_empty" });
+        return;
+      }
 
-  if (!room.members.has(userId)) {
-    reply.code(403);
-    return { error: "user_not_in_room" };
-  }
+      const newMessage: ChatMessage = {
+        id: newId(),
+        roomId: room.id,
+        userId,
+        message: trimmed,
+        createdAtMs: nowMs(),
+      };
 
-  const trimmed = message.trim();
-  if (!trimmed) {
-    reply.code(400);
-    return { error: "message_empty" };
-  }
+      const roomMessages = chatByRoom.get(room.id) ?? [];
+      roomMessages.push(newMessage);
+      if (roomMessages.length > 200) {
+        roomMessages.shift();
+      }
+      chatByRoom.set(room.id, roomMessages);
+      room.revision += 1;
 
-  const newMessage: ChatMessage = {
-    id: newId(),
-    roomId,
-    userId,
-    message: trimmed,
-    createdAtMs: nowMs(),
-  };
+      const roomSocketsForChat = socketsByRoom.get(room.id);
+      if (!roomSocketsForChat) {
+        return;
+      }
 
-  const roomMessages = chatByRoom.get(roomId) ?? [];
-  roomMessages.push(newMessage);
-  if (roomMessages.length > 200) {
-    roomMessages.shift();
-  }
-  chatByRoom.set(roomId, roomMessages);
-  room.revision += 1;
+      for (const ws of roomSocketsForChat) {
+        sendWs(ws, {
+          type: "chat_message",
+          message: newMessage,
+          revision: room.revision,
+        });
+      }
+    }
+  });
 
-  reply.code(201);
-  return newMessage;
-});
+  socket.on("close", () => {
+    const roomSocketSet = socketsByRoom.get(room.id);
+    if (!roomSocketSet) {
+      return;
+    }
 
-app.get<{
-  Params: { roomId: string };
-}>("/rooms/:roomId/chat", async (request, reply) => {
-  const { roomId } = request.params;
-  const room = getRoomOr404(roomId);
-
-  if (!room) {
-    reply.code(404);
-    return { error: "room_not_found" };
-  }
-
-  return {
-    roomId,
-    revision: room.revision,
-    messages: chatByRoom.get(roomId) ?? [],
-  };
+    roomSocketSet.delete(socket);
+    if (roomSocketSet.size === 0) {
+      socketsByRoom.delete(room.id);
+    }
+  });
 });
 
 const start = async (): Promise<void> => {
