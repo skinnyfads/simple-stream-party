@@ -47,6 +47,7 @@ type VideoItem = {
 type RequestLike = {
   protocol: string;
   hostname: string;
+  url?: string;
   headers: Record<string, string | string[] | undefined>;
 };
 
@@ -111,7 +112,7 @@ const socketsByRoom = new Map<string, Set<WebSocket>>();
 
 const app = Fastify({ logger: true });
 app.register(cors, {
-  origin: true,
+  origin: "*",
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: "*",
 });
@@ -148,6 +149,49 @@ const getBaseUrl = (request: RequestLike): string => {
       ? hostHeader
       : `${request.hostname}:${env.PORT}`;
   return `${request.protocol}://${host}`;
+};
+
+type WsRouteRequestLike = {
+  params?: { roomId?: string };
+  query?: { userId?: string; inviteToken?: string };
+  url?: string;
+  raw?: { url?: string };
+};
+
+const getRequestUrl = (request: WsRouteRequestLike): string =>
+  request.url ?? request.raw?.url ?? "";
+
+const getWsRoomId = (request: WsRouteRequestLike): string | null => {
+  if (request.params?.roomId) {
+    return request.params.roomId;
+  }
+
+  const match = /^\/rooms\/([^/]+)\/ws(?:\?|$)/.exec(getRequestUrl(request));
+  if (!match?.[1]) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+};
+
+const getWsQuery = (request: WsRouteRequestLike): {
+  userId?: string;
+  inviteToken?: string;
+} => {
+  if (request.query) {
+    return request.query;
+  }
+
+  const url = getRequestUrl(request);
+  const rawQuery = url.includes("?") ? (url.split("?")[1] ?? "") : "";
+  const params = new URLSearchParams(rawQuery);
+  const userId = params.get("userId") ?? undefined;
+  const inviteToken = params.get("inviteToken") ?? undefined;
+  return { userId, inviteToken };
 };
 
 const normalizePlayback = (playback: PlaybackState): PlaybackState => {
@@ -348,8 +392,6 @@ const applyPlaybackAction = async (
   return { ok: true };
 };
 
-app.register(websocket);
-
 app.get("/health", async () => ({
   ok: true,
   service: "simple-stream-party",
@@ -462,138 +504,153 @@ app.post<{
   return roomResponse(room, request);
 });
 
-app.get<{
-  Params: { roomId: string };
-  Querystring: {
-    userId?: string;
-    inviteToken?: string;
-  };
-}>("/rooms/:roomId/ws", { websocket: true }, (socket, request): void => {
-  const { roomId } = request.params;
-  const { userId, inviteToken } = request.query;
-  const room = getRoomOr404(roomId);
-
-  if (!room) {
-    sendWs(socket, { type: "error", error: "room_not_found" });
-    socket.close();
-    return;
-  }
-
-  if (!userId) {
-    sendWs(socket, { type: "error", error: "missing_user_id" });
-    socket.close();
-    return;
-  }
-
-  if (inviteToken !== room.inviteToken) {
-    sendWs(socket, { type: "error", error: "invalid_invite_token" });
-    socket.close();
-    return;
-  }
-
-  room.members.add(userId);
-  room.playback = normalizePlayback(room.playback);
-  room.revision += 1;
-
-  const roomSockets = socketsByRoom.get(room.id) ?? new Set<WebSocket>();
-  roomSockets.add(socket);
-  socketsByRoom.set(room.id, roomSockets);
-
-  sendWs(socket, {
-    type: "welcome",
-    room: roomResponse(room, request),
-    messages: chatByRoom.get(room.id) ?? [],
-  });
-  broadcastRoomState(room, request, userId, "join");
-
-  socket.on("message", async (raw: RawData): Promise<void> => {
-    let payload: WsClientMessage;
-    try {
-      payload = JSON.parse(raw.toString()) as WsClientMessage;
-    } catch {
-      sendWs(socket, { type: "error", error: "invalid_json" });
-      return;
-    }
-
-    if (payload.type === "ping") {
-      sendWs(socket, { type: "pong", at: new Date().toISOString() });
-      return;
-    }
-
-    if (payload.type === "sync") {
-      room.playback = normalizePlayback(room.playback);
-      room.revision += 1;
-      broadcastRoomState(room, request, userId, "sync");
-      return;
-    }
-
-    if (payload.type === "playback") {
-      const result = await applyPlaybackAction(
-        room,
-        payload.action,
-        payload.atTimeSec,
-        payload.videoId,
-      );
-
-      if (!result.ok) {
-        sendWs(socket, { type: "error", error: result.error });
-        return;
-      }
-
-      const reason =
-        payload.action === "changeVideo" ? "video_change" : "playback";
-      broadcastRoomState(room, request, userId, reason, payload.action);
-      return;
-    }
-
-    if (payload.type === "chat") {
-      const trimmed = payload.message.trim();
-      if (!trimmed) {
-        sendWs(socket, { type: "error", error: "message_empty" });
-        return;
-      }
-
-      const newMessage: ChatMessage = {
-        id: newId(),
-        roomId: room.id,
-        userId,
-        message: trimmed,
-        createdAtMs: nowMs(),
-      };
-
-      const roomMessages = chatByRoom.get(room.id) ?? [];
-      roomMessages.push(newMessage);
-      if (roomMessages.length > 200) {
-        roomMessages.shift();
-      }
-      chatByRoom.set(room.id, roomMessages);
-      room.revision += 1;
-
-      const roomSocketsForChat = socketsByRoom.get(room.id);
-      if (!roomSocketsForChat) {
-        return;
-      }
-
-      for (const ws of roomSocketsForChat) {
-        sendWs(ws, {
-          type: "chat_message",
-          message: newMessage,
-          revision: room.revision,
-        });
-      }
-    }
+app.register(async (wsApp) => {
+  await wsApp.register(websocket, {
+    options: {
+      verifyClient: () => true,
+    },
   });
 
-  socket.on("close", () => {
-    const roomSocketSet = socketsByRoom.get(room.id);
-    if (!roomSocketSet) {
+  wsApp.get<{
+    Params: { roomId: string };
+    Querystring: {
+      userId?: string;
+      inviteToken?: string;
+    };
+  }>("/rooms/:roomId/ws", { websocket: true }, (socket, request): void => {
+    const roomId = getWsRoomId(request);
+    const { userId, inviteToken } = getWsQuery(request);
+
+    if (!roomId) {
+      sendWs(socket, { type: "error", error: "room_not_found" });
+      socket.close();
       return;
     }
 
-    roomSocketSet.delete(socket);
-    if (roomSocketSet.size === 0) {
-      socketsByRoom.delete(room.id);
+    const room = getRoomOr404(roomId);
+
+    if (!room) {
+      sendWs(socket, { type: "error", error: "room_not_found" });
+      socket.close();
+      return;
     }
+
+    if (!userId) {
+      sendWs(socket, { type: "error", error: "missing_user_id" });
+      socket.close();
+      return;
+    }
+
+    if (inviteToken !== room.inviteToken) {
+      sendWs(socket, { type: "error", error: "invalid_invite_token" });
+      socket.close();
+      return;
+    }
+
+    room.members.add(userId);
+    room.playback = normalizePlayback(room.playback);
+    room.revision += 1;
+
+    const roomSockets = socketsByRoom.get(room.id) ?? new Set<WebSocket>();
+    roomSockets.add(socket);
+    socketsByRoom.set(room.id, roomSockets);
+
+    sendWs(socket, {
+      type: "welcome",
+      room: roomResponse(room, request),
+      messages: chatByRoom.get(room.id) ?? [],
+    });
+    broadcastRoomState(room, request, userId, "join");
+
+    socket.on("message", async (raw: RawData): Promise<void> => {
+      let payload: WsClientMessage;
+      try {
+        payload = JSON.parse(raw.toString()) as WsClientMessage;
+      } catch {
+        sendWs(socket, { type: "error", error: "invalid_json" });
+        return;
+      }
+
+      if (payload.type === "ping") {
+        sendWs(socket, { type: "pong", at: new Date().toISOString() });
+        return;
+      }
+
+      if (payload.type === "sync") {
+        room.playback = normalizePlayback(room.playback);
+        room.revision += 1;
+        broadcastRoomState(room, request, userId, "sync");
+        return;
+      }
+
+      if (payload.type === "playback") {
+        const result = await applyPlaybackAction(
+          room,
+          payload.action,
+          payload.atTimeSec,
+          payload.videoId,
+        );
+
+        if (!result.ok) {
+          sendWs(socket, { type: "error", error: result.error });
+          return;
+        }
+
+        const reason =
+          payload.action === "changeVideo" ? "video_change" : "playback";
+        broadcastRoomState(room, request, userId, reason, payload.action);
+        return;
+      }
+
+      if (payload.type === "chat") {
+        const trimmed = payload.message.trim();
+        if (!trimmed) {
+          sendWs(socket, { type: "error", error: "message_empty" });
+          return;
+        }
+
+        const newMessage: ChatMessage = {
+          id: newId(),
+          roomId: room.id,
+          userId,
+          message: trimmed,
+          createdAtMs: nowMs(),
+        };
+
+        const roomMessages = chatByRoom.get(room.id) ?? [];
+        roomMessages.push(newMessage);
+        if (roomMessages.length > 200) {
+          roomMessages.shift();
+        }
+        chatByRoom.set(room.id, roomMessages);
+        room.revision += 1;
+
+        const roomSocketsForChat = socketsByRoom.get(room.id);
+        if (!roomSocketsForChat) {
+          return;
+        }
+
+        for (const ws of roomSocketsForChat) {
+          sendWs(ws, {
+            type: "chat_message",
+            message: newMessage,
+            revision: room.revision,
+          });
+        }
+      }
+    });
+
+    socket.on("close", () => {
+      const roomSocketSet = socketsByRoom.get(room.id);
+      if (!roomSocketSet) {
+        return;
+      }
+
+      roomSocketSet.delete(socket);
+      if (roomSocketSet.size === 0) {
+        socketsByRoom.delete(room.id);
+      }
+    });
   });
 });
 
