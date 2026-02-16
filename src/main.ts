@@ -26,6 +26,8 @@ type Room = {
   playback: PlaybackState;
   createdAtMs: number;
   revision: number;
+  activeControllerId: string | null;
+  activeControllerUntilMs: number;
 };
 
 type ChatMessage = {
@@ -119,6 +121,8 @@ app.register(cors, {
 
 const VIDEO_EXTENSIONS = new Set([".mp4", ".webm", ".mkv", ".mov", ".m4v"]);
 const dataDir = path.resolve(process.cwd(), env.DATA_DIR);
+const SEEK_EPSILON_SEC = 1;
+const CONTROL_LEASE_MS = 2000;
 
 const nowMs = (): number => Date.now();
 
@@ -376,7 +380,7 @@ const applyPlaybackAction = async (
     if (typeof atTimeSec !== "number" || atTimeSec < 0) {
       return { ok: false, error: "invalid_seek_time" };
     }
-    if (Math.abs(playback.playbackTimeSec - atTimeSec) > 0.15) {
+    if (Math.abs(playback.playbackTimeSec - atTimeSec) > SEEK_EPSILON_SEC) {
       room.playback = {
         ...playback,
         playbackTimeSec: atTimeSec,
@@ -413,6 +417,22 @@ const applyPlaybackAction = async (
   }
 
   return { ok: true, changed };
+};
+
+const acquireControlLease = (room: Room, userId: string): boolean => {
+  const currentMs = nowMs();
+
+  if (
+    room.activeControllerId === null ||
+    room.activeControllerId === userId ||
+    currentMs > room.activeControllerUntilMs
+  ) {
+    room.activeControllerId = userId;
+    room.activeControllerUntilMs = currentMs + CONTROL_LEASE_MS;
+    return true;
+  }
+
+  return false;
 };
 
 app.get("/health", async () => ({
@@ -518,6 +538,8 @@ app.post<{
     },
     createdAtMs: nowMs(),
     revision: 1,
+    activeControllerId: creatorId,
+    activeControllerUntilMs: nowMs() + CONTROL_LEASE_MS,
   };
 
   rooms.set(room.id, room);
@@ -611,6 +633,10 @@ app.register(async (wsApp) => {
       }
 
       if (payload.type === "playback") {
+        if (!acquireControlLease(room, userId)) {
+          return;
+        }
+
         const result = await applyPlaybackAction(
           room,
           payload.action,
@@ -624,13 +650,6 @@ app.register(async (wsApp) => {
         }
 
         if (!result.changed) {
-          sendWs(socket, {
-            type: "room_state",
-            room: roomResponse(room, request),
-            reason: "sync",
-            byUserId: userId,
-            action: payload.action,
-          });
           return;
         }
 
