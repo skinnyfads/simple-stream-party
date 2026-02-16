@@ -1,0 +1,27 @@
+{
+  "name": "simple-stream-party",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch ./src/main.ts",
+    "start": "tsx ./src/main.ts",
+    "format": "prettier -w ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.28.2",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^16.4.1",
+    "envalid": "^8.0.0",
+    "fastify": "^5.7.4",
+    "tsx": "^4.19.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.13",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2"
+  }
+}
