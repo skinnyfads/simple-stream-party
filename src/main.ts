@@ -314,6 +314,7 @@ const broadcastRoomState = (
   byUserId: string,
   reason: "join" | "playback" | "video_change" | "sync",
   action?: PlaybackAction,
+  excludeSocket?: WebSocket,
 ): void => {
   const roomSockets = socketsByRoom.get(room.id);
   if (!roomSockets || roomSockets.size === 0) {
@@ -329,6 +330,9 @@ const broadcastRoomState = (
   };
 
   for (const socket of roomSockets) {
+    if (excludeSocket && socket === excludeSocket) {
+      continue;
+    }
     sendWs(socket, payload);
   }
 };
@@ -338,35 +342,48 @@ const applyPlaybackAction = async (
   action: PlaybackAction,
   atTimeSec?: number,
   videoId?: string,
-): Promise<{ ok: true } | { ok: false; error: string }> => {
+): Promise<
+  | { ok: true; changed: boolean }
+  | { ok: false; error: string }
+> => {
   const playback = normalizePlayback(room.playback);
   const currentMs = nowMs();
+  let changed = false;
 
   if (action === "play") {
-    room.playback = {
-      ...playback,
-      isPlaying: true,
-      lastUpdatedAtMs: currentMs,
-    };
+    if (!playback.isPlaying) {
+      room.playback = {
+        ...playback,
+        isPlaying: true,
+        lastUpdatedAtMs: currentMs,
+      };
+      changed = true;
+    }
   }
 
   if (action === "pause") {
-    room.playback = {
-      ...playback,
-      isPlaying: false,
-      lastUpdatedAtMs: currentMs,
-    };
+    if (playback.isPlaying) {
+      room.playback = {
+        ...playback,
+        isPlaying: false,
+        lastUpdatedAtMs: currentMs,
+      };
+      changed = true;
+    }
   }
 
   if (action === "seek") {
     if (typeof atTimeSec !== "number" || atTimeSec < 0) {
       return { ok: false, error: "invalid_seek_time" };
     }
-    room.playback = {
-      ...playback,
-      playbackTimeSec: atTimeSec,
-      lastUpdatedAtMs: currentMs,
-    };
+    if (Math.abs(playback.playbackTimeSec - atTimeSec) > 0.15) {
+      room.playback = {
+        ...playback,
+        playbackTimeSec: atTimeSec,
+        lastUpdatedAtMs: currentMs,
+      };
+      changed = true;
+    }
   }
 
   if (action === "changeVideo") {
@@ -379,17 +396,23 @@ const applyPlaybackAction = async (
       return { ok: false, error: "video_not_found" };
     }
 
-    room.playback = {
-      videoId: video.id,
-      videoUrl: video.streamPath,
-      playbackTimeSec: 0,
-      isPlaying: false,
-      lastUpdatedAtMs: currentMs,
-    };
+    if (playback.videoId !== video.id) {
+      room.playback = {
+        videoId: video.id,
+        videoUrl: video.streamPath,
+        playbackTimeSec: 0,
+        isPlaying: false,
+        lastUpdatedAtMs: currentMs,
+      };
+      changed = true;
+    }
   }
 
-  room.revision += 1;
-  return { ok: true };
+  if (changed) {
+    room.revision += 1;
+  }
+
+  return { ok: true, changed };
 };
 
 app.get("/health", async () => ({
@@ -560,7 +583,7 @@ app.register(async (wsApp) => {
       room: roomResponse(room, request),
       messages: chatByRoom.get(room.id) ?? [],
     });
-    broadcastRoomState(room, request, userId, "join");
+    broadcastRoomState(room, request, userId, "join", undefined, socket);
 
     socket.on("message", async (raw: RawData): Promise<void> => {
       let payload: WsClientMessage;
@@ -578,8 +601,12 @@ app.register(async (wsApp) => {
 
       if (payload.type === "sync") {
         room.playback = normalizePlayback(room.playback);
-        room.revision += 1;
-        broadcastRoomState(room, request, userId, "sync");
+        sendWs(socket, {
+          type: "room_state",
+          room: roomResponse(room, request),
+          reason: "sync",
+          byUserId: userId,
+        });
         return;
       }
 
@@ -596,9 +623,20 @@ app.register(async (wsApp) => {
           return;
         }
 
+        if (!result.changed) {
+          sendWs(socket, {
+            type: "room_state",
+            room: roomResponse(room, request),
+            reason: "sync",
+            byUserId: userId,
+            action: payload.action,
+          });
+          return;
+        }
+
         const reason =
           payload.action === "changeVideo" ? "video_change" : "playback";
-        broadcastRoomState(room, request, userId, reason, payload.action);
+        broadcastRoomState(room, request, userId, reason, payload.action, socket);
         return;
       }
 
