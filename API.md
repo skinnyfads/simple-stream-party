@@ -1,10 +1,11 @@
 # Simple Stream Party API
 
-This document explains how to use the current backend API.
+This document explains how to use the backend API.
 
 ## Base URL
 
-- Local: `http://localhost:3000`
+- HTTP: `http://localhost:3000`
+- WS: `ws://localhost:3000`
 - Configurable with env:
   - `HOST` (default: `0.0.0.0`)
   - `PORT` (default: `3000`)
@@ -15,9 +16,9 @@ This document explains how to use the current backend API.
 
 - Videos are read from `./data` (or `DATA_DIR`).
 - A room is created from a selected `videoId`.
-- Join requires `inviteToken`.
+- Join and real-time sync happen over WebSocket.
 - Playback state is server-authoritative.
-- Any user that has joined a room can control playback (`play`, `pause`, `seek`, `changeVideo`).
+- Any joined user can control playback (`play`, `pause`, `seek`, `changeVideo`).
 
 ## 1) Health Check
 
@@ -112,187 +113,179 @@ Possible errors:
 
 - `404 { "error": "video_not_found" }`
 
-## 5) Join Room
+## 5) Room WebSocket
 
-### `POST /rooms/:roomId/join`
+### `GET /rooms/:roomId/ws?userId=...&inviteToken=...`
 
-Body:
+Open a WebSocket connection to join the room and receive real-time updates.
+
+Example:
+
+```js
+const ws = new WebSocket(
+  `ws://localhost:3000/rooms/${roomId}/ws?userId=${encodeURIComponent(userId)}&inviteToken=${encodeURIComponent(token)}`,
+);
+```
+
+Connection errors are sent as WebSocket messages then the socket is closed:
+
+```json
+{ "type": "error", "error": "room_not_found" }
+```
+
+Possible connection errors:
+
+- `room_not_found`
+- `missing_user_id`
+- `invalid_invite_token`
+
+## 6) Client -> Server Messages
+
+### Playback action
+
+```json
+{ "type": "playback", "action": "play" }
+```
+
+```json
+{ "type": "playback", "action": "pause" }
+```
+
+```json
+{ "type": "playback", "action": "seek", "atTimeSec": 123.45 }
+```
+
+```json
+{ "type": "playback", "action": "changeVideo", "videoId": "YW5vdGhlci5tcDQ" }
+```
+
+Validation errors are returned as:
+
+```json
+{ "type": "error", "error": "invalid_seek_time" }
+```
+
+Possible playback errors:
+
+- `invalid_seek_time`
+- `missing_video_id`
+- `video_not_found`
+
+### Chat message
+
+```json
+{ "type": "chat", "message": "hello everyone" }
+```
+
+Possible error:
+
+- `message_empty`
+
+### Manual sync request
+
+```json
+{ "type": "sync" }
+```
+
+### Ping
+
+```json
+{ "type": "ping" }
+```
+
+## 7) Server -> Client Messages
+
+### Welcome (sent once on connect)
 
 ```json
 {
-  "userId": "bob",
-  "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122"
-}
-```
-
-Response:
-
-```json
-{
-  "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
-  "creatorId": "alice",
-  "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
-  "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
-  "memberCount": 2,
-  "revision": 2,
-  "playback": {
-    "videoId": "ZXhhbXBsZS5tcDQ",
-    "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
-    "playbackTimeSec": 0.8,
-    "isPlaying": true,
-    "lastUpdatedAtMs": 1739720000800
-  }
-}
-```
-
-Possible errors:
-
-- `404 { "error": "room_not_found" }`
-- `403 { "error": "invalid_invite_token" }`
-
-## 6) Get Room State (Sync)
-
-### `GET /rooms/:roomId/state`
-
-Use this to sync the player state. Server returns normalized playback time.
-
-Response:
-
-```json
-{
-  "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
-  "creatorId": "alice",
-  "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
-  "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
-  "memberCount": 2,
-  "revision": 5,
-  "playback": {
-    "videoId": "ZXhhbXBsZS5tcDQ",
-    "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
-    "playbackTimeSec": 42.3,
-    "isPlaying": true,
-    "lastUpdatedAtMs": 1739720042300
-  }
-}
-```
-
-Possible errors:
-
-- `404 { "error": "room_not_found" }`
-
-## 7) Playback Control
-
-### `POST /rooms/:roomId/playback`
-
-All joined users can control playback.
-
-Body:
-
-```json
-{
-  "userId": "bob",
-  "action": "pause"
-}
-```
-
-Supported actions:
-
-- `play`
-- `pause`
-- `seek` (requires `atTimeSec`)
-- `changeVideo` (requires `videoId`)
-
-Examples:
-
-```json
-{ "userId": "bob", "action": "seek", "atTimeSec": 123.45 }
-```
-
-```json
-{ "userId": "bob", "action": "changeVideo", "videoId": "YW5vdGhlci5tcDQ" }
-```
-
-Response:
-
-```json
-{
-  "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
-  "revision": 6,
-  "action": "pause",
-  "byUserId": "bob",
-  "playback": {
-    "videoId": "ZXhhbXBsZS5tcDQ",
-    "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
-    "playbackTimeSec": 44.2,
-    "isPlaying": false,
-    "lastUpdatedAtMs": 1739720044200
-  }
-}
-```
-
-Possible errors:
-
-- `404 { "error": "room_not_found" }`
-- `403 { "error": "user_not_in_room" }`
-- `400 { "error": "invalid_seek_time" }`
-- `400 { "error": "missing_video_id" }`
-- `404 { "error": "video_not_found" }`
-
-## 8) Chat
-
-### `POST /rooms/:roomId/chat`
-
-Body:
-
-```json
-{
-  "userId": "bob",
-  "message": "hello everyone"
-}
-```
-
-Response (`201`):
-
-```json
-{
-  "id": "e15f7ab7-a54a-4f24-a7b8-001122334455",
-  "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
-  "userId": "bob",
-  "message": "hello everyone",
-  "createdAtMs": 1739720050000
-}
-```
-
-Possible errors:
-
-- `404 { "error": "room_not_found" }`
-- `403 { "error": "user_not_in_room" }`
-- `400 { "error": "message_empty" }`
-
-### `GET /rooms/:roomId/chat`
-
-Response:
-
-```json
-{
-  "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
-  "revision": 8,
+  "type": "welcome",
+  "room": {
+    "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
+    "creatorId": "alice",
+    "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
+    "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
+    "memberCount": 2,
+    "revision": 5,
+    "playback": {
+      "videoId": "ZXhhbXBsZS5tcDQ",
+      "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
+      "playbackTimeSec": 42.3,
+      "isPlaying": true,
+      "lastUpdatedAtMs": 1739720042300
+    }
+  },
   "messages": []
 }
 ```
 
+### Room state update
+
+```json
+{
+  "type": "room_state",
+  "reason": "playback",
+  "byUserId": "bob",
+  "action": "seek",
+  "room": {
+    "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
+    "revision": 6,
+    "creatorId": "alice",
+    "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
+    "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
+    "memberCount": 2,
+    "playback": {
+      "videoId": "ZXhhbXBsZS5tcDQ",
+      "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
+      "playbackTimeSec": 44.2,
+      "isPlaying": false,
+      "lastUpdatedAtMs": 1739720044200
+    }
+  }
+}
+```
+
+`reason` values:
+
+- `join`
+- `playback`
+- `video_change`
+- `sync`
+
+### Chat event
+
+```json
+{
+  "type": "chat_message",
+  "revision": 8,
+  "message": {
+    "id": "e15f7ab7-a54a-4f24-a7b8-001122334455",
+    "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
+    "userId": "bob",
+    "message": "hello everyone",
+    "createdAtMs": 1739720050000
+  }
+}
+```
+
+### Pong
+
+```json
+{ "type": "pong", "at": "2026-02-16T20:00:00.000Z" }
+```
+
 ## Frontend Integration Flow
 
-1. Call `GET /videos` and render selectable list.
-2. On click, call `POST /rooms/from-video`.
-3. Copy/share `shareUrl`.
-4. Invitee opens link, parse `roomId` + `token`, then call `POST /rooms/:roomId/join`.
-5. Player loads `playback.videoUrl`.
-6. Send playback actions with `POST /rooms/:roomId/playback`.
-7. Poll `GET /rooms/:roomId/state` (or move to WebSocket later) to stay synced.
-8. Use chat endpoints for room chat.
+1. Call `GET /videos` and render a selectable list.
+2. Call `POST /rooms/from-video` when a video is selected.
+3. Copy/share `shareUrl` (contains room id + token).
+4. Connect WebSocket to `/rooms/:roomId/ws?userId=...&inviteToken=...`.
+5. On `welcome`, load `room.playback.videoUrl` and initial message list.
+6. Send `playback` messages when the user interacts with player controls.
+7. Apply updates from `room_state` events.
+8. Send/receive chat through `chat` and `chat_message` events.
 
 ## Notes
 
-- Current storage is in-memory for rooms/chat; data resets on restart.
-- Current sync transport is HTTP polling (no WebSocket push yet).
+- Storage is in-memory for rooms/chat; data resets on restart.
+- Sync transport uses WebSocket.
