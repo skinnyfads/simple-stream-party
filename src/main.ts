@@ -3,6 +3,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import Fastify from "fastify";
+import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import env from "./env.js";
 import type { RawData, WebSocket } from "ws";
@@ -109,6 +110,11 @@ const chatByRoom = new Map<string, ChatMessage[]>();
 const socketsByRoom = new Map<string, Set<WebSocket>>();
 
 const app = Fastify({ logger: true });
+app.register(cors, {
+  origin: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: "*",
+});
 
 const VIDEO_EXTENSIONS = new Set([".mp4", ".webm", ".mkv", ".mov", ".m4v"]);
 const dataDir = path.resolve(process.cwd(), env.DATA_DIR);
