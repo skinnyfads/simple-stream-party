@@ -123,6 +123,7 @@ const VIDEO_EXTENSIONS = new Set([".mp4", ".webm", ".mkv", ".mov", ".m4v"]);
 const dataDir = path.resolve(process.cwd(), env.DATA_DIR);
 const SEEK_EPSILON_SEC = 1;
 const CONTROL_LEASE_MS = 2000;
+const PLAYBACK_SYNC_INTERVAL_MS = 2000;
 
 const nowMs = (): number => Date.now();
 
@@ -203,6 +204,13 @@ const getBaseUrl = (request: RequestLike): string => {
       ? hostHeader
       : `${request.hostname}:${env.PORT}`;
   return `${request.protocol}://${host}`;
+};
+
+const getServerBaseUrl = (): string => {
+  if (env.PUBLIC_BASE_URL) {
+    return env.PUBLIC_BASE_URL;
+  }
+  return `http://${env.HOST}:${env.PORT}`;
 };
 
 type WsRouteRequestLike = {
@@ -341,8 +349,8 @@ const getVideoById = async (videoId: string): Promise<VideoItem | null> => {
   }
 };
 
-const roomResponse = (room: Room, request: RequestLike): RoomResponse => {
-  const baseUrl = getBaseUrl(request);
+const roomResponse = (room: Room, request?: RequestLike): RoomResponse => {
+  const baseUrl = request ? getBaseUrl(request) : getServerBaseUrl();
   const shareUrl = `${baseUrl}/room/${room.id}?token=${room.inviteToken}`;
   return {
     roomId: room.id,
@@ -364,7 +372,7 @@ const sendWs = (socket: WebSocket, payload: WsServerMessage): void => {
 
 const broadcastRoomState = (
   room: Room,
-  request: RequestLike,
+  request: RequestLike | undefined,
   byUserId: string,
   reason: "join" | "playback" | "video_change" | "sync",
   action?: PlaybackAction,
@@ -390,6 +398,34 @@ const broadcastRoomState = (
     sendWs(socket, payload);
   }
 };
+
+const periodicPlaybackSync = setInterval(() => {
+  for (const [roomId, roomSockets] of socketsByRoom.entries()) {
+    if (roomSockets.size === 0) {
+      continue;
+    }
+
+    const room = rooms.get(roomId);
+    if (!room || !room.playback.isPlaying) {
+      continue;
+    }
+
+    room.playback = normalizePlayback(room.playback);
+
+    const payload: WsServerMessage = {
+      type: "room_state",
+      room: roomResponse(room),
+      reason: "sync",
+      byUserId: "system",
+    };
+
+    for (const socket of roomSockets) {
+      sendWs(socket, payload);
+    }
+  }
+}, PLAYBACK_SYNC_INTERVAL_MS);
+
+periodicPlaybackSync.unref();
 
 const applyPlaybackAction = async (
   room: Room,
