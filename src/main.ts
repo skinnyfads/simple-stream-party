@@ -142,6 +142,56 @@ const fromVideoId = (videoId: string): string | null => {
 const streamPathForVideoId = (videoId: string): string =>
   `/videos/${videoId}/stream`;
 
+const parseSingleRange = (
+  rangeHeader: string,
+  sizeBytes: number,
+): { start: number; end: number } | null => {
+  // Support only a single bytes range.
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!match) {
+    return null;
+  }
+
+  const rawStart = match[1];
+  const rawEnd = match[2];
+
+  if (!rawStart && !rawEnd) {
+    return null;
+  }
+
+  // Suffix form: bytes=-500 (last 500 bytes)
+  if (!rawStart) {
+    const suffixLength = Number(rawEnd);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+      return null;
+    }
+
+    const chunkSize = Math.min(sizeBytes, Math.floor(suffixLength));
+    return {
+      start: Math.max(0, sizeBytes - chunkSize),
+      end: sizeBytes - 1,
+    };
+  }
+
+  const start = Number(rawStart);
+  if (!Number.isFinite(start) || start < 0 || start >= sizeBytes) {
+    return null;
+  }
+
+  if (!rawEnd) {
+    return { start, end: sizeBytes - 1 };
+  }
+
+  const parsedEnd = Number(rawEnd);
+  if (!Number.isFinite(parsedEnd) || parsedEnd < start) {
+    return null;
+  }
+
+  // Clamp end so requests like bytes=0-999999999 are still satisfiable.
+  const end = Math.min(sizeBytes - 1, Math.floor(parsedEnd));
+  return { start, end };
+};
+
 const getBaseUrl = (request: RequestLike): string => {
   if (env.PUBLIC_BASE_URL) {
     return env.PUBLIC_BASE_URL;
@@ -476,31 +526,19 @@ app.get<{
 
   if (!rangeHeader) {
     reply.header("Content-Type", contentType);
+    reply.header("Accept-Ranges", "bytes");
     reply.header("Content-Length", video.sizeBytes.toString());
     return reply.send(fs.createReadStream(fullPath));
   }
 
-  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
-  if (!match) {
+  const range = parseSingleRange(rangeHeader, video.sizeBytes);
+  if (!range) {
     reply.code(416);
     reply.header("Content-Range", `bytes */${video.sizeBytes}`);
     return { error: "invalid_range" };
   }
 
-  const start = match[1] ? Number(match[1]) : 0;
-  const end = match[2] ? Number(match[2]) : video.sizeBytes - 1;
-
-  if (
-    Number.isNaN(start) ||
-    Number.isNaN(end) ||
-    start < 0 ||
-    end < start ||
-    end >= video.sizeBytes
-  ) {
-    reply.code(416);
-    reply.header("Content-Range", `bytes */${video.sizeBytes}`);
-    return { error: "range_not_satisfiable" };
-  }
+  const { start, end } = range;
 
   const chunkSize = end - start + 1;
   reply.code(206);
