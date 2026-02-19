@@ -213,6 +213,28 @@ const getServerBaseUrl = (): string => {
   return `http://${env.HOST}:${env.PORT}`;
 };
 
+const playbackSummary = (playback: PlaybackState): string => {
+  const minutes = (playback.playbackTimeSec / 60).toFixed(2);
+  return `${playback.playbackTimeSec.toFixed(2)}s (${minutes}m)`;
+};
+
+const toPlaybackChatMessage = (
+  action: PlaybackAction,
+  userId: string,
+  playback: PlaybackState,
+): string => {
+  if (action === "play") {
+    return `${userId} resumed video at ${playbackSummary(playback)}.`;
+  }
+  if (action === "pause") {
+    return `${userId} paused video at ${playbackSummary(playback)}.`;
+  }
+  if (action === "seek") {
+    return `${userId} seeked to ${playbackSummary(playback)}.`;
+  }
+  return `${userId} changed video to ${playback.videoId}.`;
+};
+
 type WsRouteRequestLike = {
   params?: { roomId?: string };
   query?: { userId?: string; inviteToken?: string };
@@ -666,6 +688,15 @@ app.register(async (wsApp) => {
       return;
     }
 
+    app.log.info(
+      {
+        event: "room_join",
+        roomId: room.id,
+        userId,
+      },
+      "User joined room",
+    );
+
     room.members.add(userId);
     room.playback = normalizePlayback(room.playback);
     room.revision += 1;
@@ -708,6 +739,17 @@ app.register(async (wsApp) => {
 
       if (payload.type === "playback") {
         if (!acquireControlLease(room, userId)) {
+          app.log.info(
+            {
+              event: "playback_rejected_control_lease",
+              roomId: room.id,
+              userId,
+              action: payload.action,
+              activeControllerId: room.activeControllerId,
+              activeControllerUntilMs: room.activeControllerUntilMs,
+            },
+            "Playback action rejected because control lease is held by another user",
+          );
           return;
         }
 
@@ -719,12 +761,81 @@ app.register(async (wsApp) => {
         );
 
         if (!result.ok) {
+          app.log.warn(
+            {
+              event: "playback_rejected_invalid_action",
+              roomId: room.id,
+              userId,
+              action: payload.action,
+              atTimeSec: payload.atTimeSec,
+              videoId: payload.videoId,
+              error: result.error,
+            },
+            "Playback action rejected",
+          );
           sendWs(socket, { type: "error", error: result.error });
           return;
         }
 
         if (!result.changed) {
+          app.log.info(
+            {
+              event: "playback_ignored_no_change",
+              roomId: room.id,
+              userId,
+              action: payload.action,
+              atTimeSec: payload.atTimeSec,
+              videoId: payload.videoId,
+              playbackTime: playbackSummary(room.playback),
+            },
+            "Playback action ignored because state is unchanged",
+          );
           return;
+        }
+
+        app.log.info(
+          {
+            event: "playback_action_applied",
+            roomId: room.id,
+            userId,
+            action: payload.action,
+            atTimeSec: payload.atTimeSec,
+            atMinute:
+              typeof payload.atTimeSec === "number"
+                ? Number((payload.atTimeSec / 60).toFixed(2))
+                : undefined,
+            videoId: payload.videoId ?? room.playback.videoId,
+            playbackTime: playbackSummary(room.playback),
+            isPlaying: room.playback.isPlaying,
+            revision: room.revision,
+          },
+          "Playback action applied",
+        );
+
+        const roomMessages = chatByRoom.get(room.id) ?? [];
+        const playbackLogMessage: ChatMessage = {
+          id: newId(),
+          roomId: room.id,
+          userId: "system",
+          message: toPlaybackChatMessage(payload.action, userId, room.playback),
+          createdAtMs: nowMs(),
+        };
+        roomMessages.push(playbackLogMessage);
+        if (roomMessages.length > 200) {
+          roomMessages.shift();
+        }
+        chatByRoom.set(room.id, roomMessages);
+        room.revision += 1;
+
+        const roomSocketsForChat = socketsByRoom.get(room.id);
+        if (roomSocketsForChat) {
+          for (const ws of roomSocketsForChat) {
+            sendWs(ws, {
+              type: "chat_message",
+              message: playbackLogMessage,
+              revision: room.revision,
+            });
+          }
         }
 
         const reason =
@@ -772,6 +883,15 @@ app.register(async (wsApp) => {
     });
 
     socket.on("close", () => {
+      app.log.info(
+        {
+          event: "room_leave",
+          roomId: room.id,
+          userId,
+        },
+        "User left room",
+      );
+
       const roomSocketSet = socketsByRoom.get(room.id);
       if (!roomSocketSet) {
         return;
