@@ -322,23 +322,6 @@ const setNicknameForUser = (
   return "updated";
 };
 
-const toPlaybackChatMessage = (
-  action: PlaybackAction,
-  userDisplayName: string,
-  playback: PlaybackState,
-): string => {
-  if (action === "play") {
-    return `${userDisplayName} resumed video at ${playbackSummary(playback)}.`;
-  }
-  if (action === "pause") {
-    return `${userDisplayName} paused video at ${playbackSummary(playback)}.`;
-  }
-  if (action === "seek") {
-    return `${userDisplayName} seeked to ${playbackSummary(playback)}.`;
-  }
-  return `${userDisplayName} changed video to ${playback.videoId}.`;
-};
-
 type WsRouteRequestLike = {
   params?: { roomId?: string };
   query?: { userId?: string; inviteToken?: string; nickname?: string };
@@ -576,37 +559,7 @@ const flushPendingPlaybackBurst = (roomId: string, userId: string): void => {
 
   const dedupedEvents = dedupePlaybackBurst(pending.events);
   for (const event of dedupedEvents) {
-    const { room, request, excludeSocket, playback } = event.meta;
-
-    const roomMessages = chatByRoom.get(room.id) ?? [];
-    const playbackLogMessage: ChatMessage = {
-      id: newId(),
-      roomId: room.id,
-      userId: "system",
-      message: toPlaybackChatMessage(
-        event.action,
-        getDisplayNameForUser(room, userId),
-        playback,
-      ),
-      createdAtMs: nowMs(),
-    };
-    roomMessages.push(playbackLogMessage);
-    if (roomMessages.length > 200) {
-      roomMessages.shift();
-    }
-    chatByRoom.set(room.id, roomMessages);
-    room.revision += 1;
-
-    const roomSocketsForChat = socketsByRoom.get(room.id);
-    if (roomSocketsForChat) {
-      for (const ws of roomSocketsForChat) {
-        sendWs(ws, {
-          type: "chat_message",
-          message: playbackLogMessage,
-          revision: room.revision,
-        });
-      }
-    }
+    const { room, request, excludeSocket } = event.meta;
 
     broadcastRoomState(room, request, userId, "playback", event.action, excludeSocket);
   }
@@ -1227,36 +1180,6 @@ app.register(async (wsApp) => {
         );
 
         if (payload.action === "changeVideo") {
-          const roomMessages = chatByRoom.get(room.id) ?? [];
-          const playbackLogMessage: ChatMessage = {
-            id: newId(),
-            roomId: room.id,
-            userId: "system",
-            message: toPlaybackChatMessage(
-              payload.action,
-              getDisplayNameForUser(room, userId),
-              room.playback,
-            ),
-            createdAtMs: nowMs(),
-          };
-          roomMessages.push(playbackLogMessage);
-          if (roomMessages.length > 200) {
-            roomMessages.shift();
-          }
-          chatByRoom.set(room.id, roomMessages);
-          room.revision += 1;
-
-          const roomSocketsForChat = socketsByRoom.get(room.id);
-          if (roomSocketsForChat) {
-            for (const ws of roomSocketsForChat) {
-              sendWs(ws, {
-                type: "chat_message",
-                message: playbackLogMessage,
-                revision: room.revision,
-              });
-            }
-          }
-
           sendRoomStateToSocket(
             socket,
             room,

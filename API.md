@@ -358,6 +358,7 @@ Possible error:
 
 `replyToMessageId` is optional and only present when the message is a reply.
 `userDisplayName` is optional.
+Playback actions (`play`, `pause`, `seek`, `changeVideo`) are not emitted as chat messages; they are delivered via `room_state` updates.
 
 ### Pong
 
