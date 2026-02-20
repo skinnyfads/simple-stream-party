@@ -151,6 +151,7 @@ type PendingPlaybackBurst = {
   events: PlaybackBurstEvent<PendingPlaybackMeta>[];
 };
 const pendingPlaybackBurstsByRoomUser = new Map<string, PendingPlaybackBurst>();
+const recentPauseByRoomUser = new Map<string, number>();
 
 const app = Fastify({ logger: true });
 app.register(cors, {
@@ -165,6 +166,7 @@ const SEEK_EPSILON_SEC = 1;
 const CONTROL_LEASE_MS = 2000;
 const PLAYBACK_SYNC_INTERVAL_MS = 2000;
 const PLAYBACK_DEDUPE_WINDOW_MS = 1000;
+const SEEK_PAUSE_NOISE_WINDOW_MS = 500;
 
 const nowMs = (): number => Date.now();
 
@@ -520,6 +522,30 @@ const broadcastRoomState = (
   }
 };
 
+const sendRoomStateToSocket = (
+  socket: WebSocket,
+  room: Room,
+  request: RequestLike | undefined,
+  byUserId: string,
+  reason:
+    | "join"
+    | "leave"
+    | "playback"
+    | "video_change"
+    | "sync"
+    | "nickname_change",
+  action?: PlaybackAction,
+): void => {
+  sendWs(socket, {
+    type: "room_state",
+    room: roomResponse(room, request),
+    reason,
+    byUserId,
+    byDisplayName: getDisplayNameForUser(room, byUserId),
+    action,
+  });
+};
+
 const roomUserDedupeKey = (roomId: string, userId: string): string =>
   `${roomId}:${userId}`;
 
@@ -635,6 +661,14 @@ const removeMemberFromRoom = (room: Room, userId: string): boolean => {
   if (!room.members.has(userId)) {
     return false;
   }
+
+  const key = roomUserDedupeKey(room.id, userId);
+  const pendingPlaybackBurst = pendingPlaybackBurstsByRoomUser.get(key);
+  if (pendingPlaybackBurst) {
+    clearTimeout(pendingPlaybackBurst.timeout);
+    pendingPlaybackBurstsByRoomUser.delete(key);
+  }
+  recentPauseByRoomUser.delete(key);
 
   room.members.delete(userId);
   room.memberProfiles.delete(userId);
@@ -1071,6 +1105,9 @@ app.register(async (wsApp) => {
       }
 
       if (payload.type === "playback") {
+        const playbackBeforeAction = room.playback;
+        const roomUserKey = roomUserDedupeKey(room.id, userId);
+
         if (!acquireControlLease(room, userId)) {
           app.log.info(
             {
@@ -1126,6 +1163,28 @@ app.register(async (wsApp) => {
           return;
         }
 
+        if (payload.action === "pause" && playbackBeforeAction.isPlaying) {
+          recentPauseByRoomUser.set(roomUserKey, nowMs());
+        } else if (payload.action !== "seek") {
+          recentPauseByRoomUser.delete(roomUserKey);
+        }
+
+        if (payload.action === "seek" && !room.playback.isPlaying) {
+          const pausedAtMs = recentPauseByRoomUser.get(roomUserKey);
+          if (
+            typeof pausedAtMs === "number" &&
+            nowMs() - pausedAtMs <= SEEK_PAUSE_NOISE_WINDOW_MS
+          ) {
+            room.playback = {
+              ...room.playback,
+              isPlaying: true,
+              lastUpdatedAtMs: nowMs(),
+            };
+            room.revision += 1;
+          }
+          recentPauseByRoomUser.delete(roomUserKey);
+        }
+
         app.log.info(
           {
             event: "playback_action_applied",
@@ -1176,10 +1235,26 @@ app.register(async (wsApp) => {
             }
           }
 
+          sendRoomStateToSocket(
+            socket,
+            room,
+            request,
+            userId,
+            "video_change",
+            payload.action,
+          );
           broadcastRoomState(room, request, userId, "video_change", payload.action, socket);
           return;
         }
 
+        sendRoomStateToSocket(
+          socket,
+          room,
+          request,
+          userId,
+          "playback",
+          payload.action,
+        );
         enqueuePlaybackBurstEvent(room, request, userId, payload.action, socket);
         return;
       }
