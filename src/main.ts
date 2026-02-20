@@ -6,6 +6,11 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import env from "./env.js";
+import {
+  dedupePlaybackBurst,
+  type DedupablePlaybackAction,
+  type PlaybackBurstEvent,
+} from "./playback-dedupe.js";
 import type { RawData, WebSocket } from "ws";
 
 type PlaybackAction = "play" | "pause" | "seek" | "changeVideo";
@@ -114,6 +119,18 @@ const rooms = new Map<string, Room>();
 const chatByRoom = new Map<string, ChatMessage[]>();
 const socketsByRoom = new Map<string, Set<WebSocket>>();
 const socketUserByConnection = new WeakMap<WebSocket, string>();
+type PendingPlaybackMeta = {
+  room: Room;
+  request?: RequestLike;
+  userId: string;
+  excludeSocket?: WebSocket;
+  playback: PlaybackState;
+};
+type PendingPlaybackBurst = {
+  timeout: NodeJS.Timeout;
+  events: PlaybackBurstEvent<PendingPlaybackMeta>[];
+};
+const pendingPlaybackBurstsByRoomUser = new Map<string, PendingPlaybackBurst>();
 
 const app = Fastify({ logger: true });
 app.register(cors, {
@@ -127,6 +144,7 @@ const dataDir = path.resolve(process.cwd(), env.DATA_DIR);
 const SEEK_EPSILON_SEC = 1;
 const CONTROL_LEASE_MS = 2000;
 const PLAYBACK_SYNC_INTERVAL_MS = 2000;
+const PLAYBACK_DEDUPE_WINDOW_MS = 1000;
 
 const nowMs = (): number => Date.now();
 
@@ -422,6 +440,92 @@ const broadcastRoomState = (
     }
     sendWs(socket, payload);
   }
+};
+
+const roomUserDedupeKey = (roomId: string, userId: string): string =>
+  `${roomId}:${userId}`;
+
+const flushPendingPlaybackBurst = (roomId: string, userId: string): void => {
+  const key = roomUserDedupeKey(roomId, userId);
+  const pending = pendingPlaybackBurstsByRoomUser.get(key);
+  if (!pending) {
+    return;
+  }
+  pendingPlaybackBurstsByRoomUser.delete(key);
+
+  const dedupedEvents = dedupePlaybackBurst(pending.events);
+  for (const event of dedupedEvents) {
+    const { room, request, excludeSocket, playback } = event.meta;
+
+    const roomMessages = chatByRoom.get(room.id) ?? [];
+    const playbackLogMessage: ChatMessage = {
+      id: newId(),
+      roomId: room.id,
+      userId: "system",
+      message: toPlaybackChatMessage(event.action, userId, playback),
+      createdAtMs: nowMs(),
+    };
+    roomMessages.push(playbackLogMessage);
+    if (roomMessages.length > 200) {
+      roomMessages.shift();
+    }
+    chatByRoom.set(room.id, roomMessages);
+    room.revision += 1;
+
+    const roomSocketsForChat = socketsByRoom.get(room.id);
+    if (roomSocketsForChat) {
+      for (const ws of roomSocketsForChat) {
+        sendWs(ws, {
+          type: "chat_message",
+          message: playbackLogMessage,
+          revision: room.revision,
+        });
+      }
+    }
+
+    broadcastRoomState(room, request, userId, "playback", event.action, excludeSocket);
+  }
+};
+
+const enqueuePlaybackBurstEvent = (
+  room: Room,
+  request: RequestLike | undefined,
+  userId: string,
+  action: DedupablePlaybackAction,
+  excludeSocket: WebSocket | undefined,
+): void => {
+  const key = roomUserDedupeKey(room.id, userId);
+  const pending = pendingPlaybackBurstsByRoomUser.get(key);
+  const event: PlaybackBurstEvent<PendingPlaybackMeta> = {
+    action,
+    playbackTimeSec: room.playback.playbackTimeSec,
+    meta: {
+      room,
+      request,
+      userId,
+      excludeSocket,
+      playback: room.playback,
+    },
+  };
+
+  if (!pending) {
+    const timeout = setTimeout(() => {
+      flushPendingPlaybackBurst(room.id, userId);
+    }, PLAYBACK_DEDUPE_WINDOW_MS);
+    timeout.unref();
+    pendingPlaybackBurstsByRoomUser.set(key, {
+      timeout,
+      events: [event],
+    });
+    return;
+  }
+
+  pending.events.push(event);
+  clearTimeout(pending.timeout);
+  pending.timeout = setTimeout(() => {
+    flushPendingPlaybackBurst(room.id, userId);
+  }, PLAYBACK_DEDUPE_WINDOW_MS);
+  pending.timeout.unref();
 };
 
 const hasOpenSocketForUser = (
@@ -900,35 +1004,38 @@ app.register(async (wsApp) => {
           "Playback action applied",
         );
 
-        const roomMessages = chatByRoom.get(room.id) ?? [];
-        const playbackLogMessage: ChatMessage = {
-          id: newId(),
-          roomId: room.id,
-          userId: "system",
-          message: toPlaybackChatMessage(payload.action, userId, room.playback),
-          createdAtMs: nowMs(),
-        };
-        roomMessages.push(playbackLogMessage);
-        if (roomMessages.length > 200) {
-          roomMessages.shift();
-        }
-        chatByRoom.set(room.id, roomMessages);
-        room.revision += 1;
-
-        const roomSocketsForChat = socketsByRoom.get(room.id);
-        if (roomSocketsForChat) {
-          for (const ws of roomSocketsForChat) {
-            sendWs(ws, {
-              type: "chat_message",
-              message: playbackLogMessage,
-              revision: room.revision,
-            });
+        if (payload.action === "changeVideo") {
+          const roomMessages = chatByRoom.get(room.id) ?? [];
+          const playbackLogMessage: ChatMessage = {
+            id: newId(),
+            roomId: room.id,
+            userId: "system",
+            message: toPlaybackChatMessage(payload.action, userId, room.playback),
+            createdAtMs: nowMs(),
+          };
+          roomMessages.push(playbackLogMessage);
+          if (roomMessages.length > 200) {
+            roomMessages.shift();
           }
+          chatByRoom.set(room.id, roomMessages);
+          room.revision += 1;
+
+          const roomSocketsForChat = socketsByRoom.get(room.id);
+          if (roomSocketsForChat) {
+            for (const ws of roomSocketsForChat) {
+              sendWs(ws, {
+                type: "chat_message",
+                message: playbackLogMessage,
+                revision: room.revision,
+              });
+            }
+          }
+
+          broadcastRoomState(room, request, userId, "video_change", payload.action, socket);
+          return;
         }
 
-        const reason =
-          payload.action === "changeVideo" ? "video_change" : "playback";
-        broadcastRoomState(room, request, userId, reason, payload.action, socket);
+        enqueuePlaybackBurstEvent(room, request, userId, payload.action, socket);
         return;
       }
 
