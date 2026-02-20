@@ -165,7 +165,7 @@ const dataDir = path.resolve(process.cwd(), env.DATA_DIR);
 const SEEK_EPSILON_SEC = 1;
 const CONTROL_LEASE_MS = 2000;
 const PLAYBACK_SYNC_INTERVAL_MS = 2000;
-const PLAYBACK_DEDUPE_WINDOW_MS = 1000;
+const PLAYBACK_DEDUPE_WINDOW_MS = 250;
 const SEEK_PAUSE_NOISE_WINDOW_MS = 500;
 
 const nowMs = (): number => Date.now();
@@ -185,6 +185,23 @@ const fromVideoId = (videoId: string): string | null => {
 
 const streamPathForVideoId = (videoId: string): string =>
   `/videos/${videoId}/stream`;
+
+const contentTypeForVideo = (fileName: string): string => {
+  const ext = path.extname(fileName).toLowerCase();
+  if (ext === ".webm") {
+    return "video/webm";
+  }
+  if (ext === ".mkv") {
+    return "video/x-matroska";
+  }
+  if (ext === ".mov") {
+    return "video/quicktime";
+  }
+  if (ext === ".m4v") {
+    return "video/x-m4v";
+  }
+  return "video/mp4";
+};
 
 const parseSingleRange = (
   rangeHeader: string,
@@ -681,6 +698,7 @@ const removeMemberFromRoom = (room: Room, userId: string): boolean => {
 };
 
 const periodicPlaybackSync = setInterval(() => {
+  const currentMs = nowMs();
   for (const [roomId, roomSockets] of socketsByRoom.entries()) {
     if (roomSockets.size === 0) {
       continue;
@@ -701,6 +719,13 @@ const periodicPlaybackSync = setInterval(() => {
     };
 
     for (const socket of roomSockets) {
+      if (
+        room.activeControllerId &&
+        currentMs <= room.activeControllerUntilMs &&
+        socketUserByConnection.get(socket) === room.activeControllerId
+      ) {
+        continue;
+      }
       sendWs(socket, payload);
     }
   }
@@ -836,10 +861,7 @@ app.get<{
 
   const fullPath = path.join(dataDir, video.fileName);
   const rangeHeader = request.headers.range;
-  const contentType =
-    path.extname(video.fileName).toLowerCase() === ".webm"
-      ? "video/webm"
-      : "video/mp4";
+  const contentType = contentTypeForVideo(video.fileName);
 
   if (!rangeHeader) {
     reply.header("Content-Type", contentType);
