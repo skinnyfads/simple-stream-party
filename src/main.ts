@@ -36,6 +36,7 @@ type ChatMessage = {
   userId: string;
   message: string;
   createdAtMs: number;
+  replyToMessageId?: string;
 };
 
 type VideoItem = {
@@ -63,6 +64,7 @@ type WsClientMessage =
   | {
       type: "chat";
       message: string;
+      replyToMessageId?: string;
     }
   | {
       type: "sync";
@@ -851,15 +853,35 @@ app.register(async (wsApp) => {
           return;
         }
 
+        const rawReplyToMessageId = payload.replyToMessageId;
+        const replyToMessageId =
+          typeof rawReplyToMessageId === "string"
+            ? rawReplyToMessageId.trim()
+            : undefined;
+
+        if (replyToMessageId === "") {
+          sendWs(socket, { type: "error", error: "invalid_reply_message_id" });
+          return;
+        }
+
+        const roomMessages = chatByRoom.get(room.id) ?? [];
+        if (
+          replyToMessageId &&
+          !roomMessages.some((message) => message.id === replyToMessageId)
+        ) {
+          sendWs(socket, { type: "error", error: "reply_message_not_found" });
+          return;
+        }
+
         const newMessage: ChatMessage = {
           id: newId(),
           roomId: room.id,
           userId,
           message: trimmed,
           createdAtMs: nowMs(),
+          ...(replyToMessageId ? { replyToMessageId } : {}),
         };
 
-        const roomMessages = chatByRoom.get(room.id) ?? [];
         roomMessages.push(newMessage);
         if (roomMessages.length > 200) {
           roomMessages.shift();

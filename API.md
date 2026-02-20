@@ -177,9 +177,21 @@ Possible playback errors:
 { "type": "chat", "message": "hello everyone" }
 ```
 
+Reply to a previous chat message by id:
+
+```json
+{
+  "type": "chat",
+  "message": "I agree",
+  "replyToMessageId": "e15f7ab7-a54a-4f24-a7b8-001122334455"
+}
+```
+
 Possible error:
 
 - `message_empty`
+- `invalid_reply_message_id`
+- `reply_message_not_found`
 
 ### Manual sync request
 
@@ -263,10 +275,13 @@ Possible error:
     "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
     "userId": "bob",
     "message": "hello everyone",
-    "createdAtMs": 1739720050000
+    "createdAtMs": 1739720050000,
+    "replyToMessageId": "5f4f4c8d-8e9d-4e7e-8a1d-889900112233"
   }
 }
 ```
+
+`replyToMessageId` is optional and only present when the message is a reply.
 
 ### Pong
 
