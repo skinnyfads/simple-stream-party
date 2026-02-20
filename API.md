@@ -139,7 +139,51 @@ Possible connection errors:
 - `missing_user_id`
 - `invalid_invite_token`
 
-## 6) Client -> Server Messages
+## 6) Leave Room
+
+### `POST /rooms/:roomId/leave`
+
+Removes a user from `room.members`, broadcasts a `room_state` update with `reason: "leave"`, and closes that user's active sockets in the room.
+
+Body:
+
+```json
+{
+  "userId": "bob",
+  "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122"
+}
+```
+
+Response (`200`):
+
+```json
+{
+  "left": true,
+  "room": {
+    "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
+    "creatorId": "alice",
+    "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
+    "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
+    "memberCount": 1,
+    "revision": 9,
+    "playback": {
+      "videoId": "ZXhhbXBsZS5tcDQ",
+      "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
+      "playbackTimeSec": 44.2,
+      "isPlaying": false,
+      "lastUpdatedAtMs": 1739720044200
+    }
+  }
+}
+```
+
+Possible errors:
+
+- `400 { "error": "missing_user_id" }`
+- `403 { "error": "invalid_invite_token" }`
+- `404 { "error": "room_not_found" }`
+
+## 7) Client -> Server Messages
 
 ### Playback action
 
@@ -205,7 +249,7 @@ Possible error:
 { "type": "ping" }
 ```
 
-## 7) Server -> Client Messages
+## 8) Server -> Client Messages
 
 ### Welcome (sent once on connect)
 
@@ -260,6 +304,7 @@ Possible error:
 `reason` values:
 
 - `join`
+- `leave`
 - `playback`
 - `video_change`
 - `sync`
@@ -299,6 +344,7 @@ Possible error:
 6. Send `playback` messages when the user interacts with player controls.
 7. Apply updates from `room_state` events.
 8. Send/receive chat through `chat` and `chat_message` events.
+9. When a user leaves intentionally, call `POST /rooms/:roomId/leave`.
 
 ## Notes
 

@@ -82,7 +82,7 @@ type WsServerMessage =
   | {
       type: "room_state";
       room: RoomResponse;
-      reason: "join" | "playback" | "video_change" | "sync";
+      reason: "join" | "leave" | "playback" | "video_change" | "sync";
       byUserId: string;
       action?: PlaybackAction;
     }
@@ -113,6 +113,7 @@ type RoomResponse = {
 const rooms = new Map<string, Room>();
 const chatByRoom = new Map<string, ChatMessage[]>();
 const socketsByRoom = new Map<string, Set<WebSocket>>();
+const socketUserByConnection = new WeakMap<WebSocket, string>();
 
 const app = Fastify({ logger: true });
 app.register(cors, {
@@ -398,7 +399,7 @@ const broadcastRoomState = (
   room: Room,
   request: RequestLike | undefined,
   byUserId: string,
-  reason: "join" | "playback" | "video_change" | "sync",
+  reason: "join" | "leave" | "playback" | "video_change" | "sync",
   action?: PlaybackAction,
   excludeSocket?: WebSocket,
 ): void => {
@@ -421,6 +422,41 @@ const broadcastRoomState = (
     }
     sendWs(socket, payload);
   }
+};
+
+const hasOpenSocketForUser = (
+  roomId: string,
+  userId: string,
+  excludeSocket?: WebSocket,
+): boolean => {
+  const roomSockets = socketsByRoom.get(roomId);
+  if (!roomSockets || roomSockets.size === 0) {
+    return false;
+  }
+
+  for (const socket of roomSockets) {
+    if (excludeSocket && socket === excludeSocket) {
+      continue;
+    }
+    if (socketUserByConnection.get(socket) === userId) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const removeMemberFromRoom = (room: Room, userId: string): boolean => {
+  if (!room.members.has(userId)) {
+    return false;
+  }
+
+  room.members.delete(userId);
+  if (room.activeControllerId === userId) {
+    room.activeControllerId = null;
+    room.activeControllerUntilMs = 0;
+  }
+  room.revision += 1;
+  return true;
 };
 
 const periodicPlaybackSync = setInterval(() => {
@@ -647,6 +683,55 @@ app.post<{
   return roomResponse(room, request);
 });
 
+app.post<{
+  Params: {
+    roomId: string;
+  };
+  Body: {
+    userId: string;
+    inviteToken: string;
+  };
+}>("/rooms/:roomId/leave", async (request, reply) => {
+  const { roomId } = request.params;
+  const { userId, inviteToken } = request.body;
+  const trimmedUserId = userId?.trim();
+
+  if (!trimmedUserId) {
+    reply.code(400);
+    return { error: "missing_user_id" };
+  }
+
+  const room = getRoomOr404(roomId);
+  if (!room) {
+    reply.code(404);
+    return { error: "room_not_found" };
+  }
+
+  if (inviteToken !== room.inviteToken) {
+    reply.code(403);
+    return { error: "invalid_invite_token" };
+  }
+
+  const didLeave = removeMemberFromRoom(room, trimmedUserId);
+  if (didLeave) {
+    broadcastRoomState(room, request, trimmedUserId, "leave");
+  }
+
+  const roomSockets = socketsByRoom.get(room.id);
+  if (roomSockets) {
+    for (const socket of roomSockets) {
+      if (socketUserByConnection.get(socket) === trimmedUserId) {
+        socket.close(1000, "left_room");
+      }
+    }
+  }
+
+  return {
+    left: didLeave,
+    room: roomResponse(room, request),
+  };
+});
+
 app.register(async (wsApp) => {
   await wsApp.register(websocket, {
     options: {
@@ -706,6 +791,7 @@ app.register(async (wsApp) => {
     const roomSockets = socketsByRoom.get(room.id) ?? new Set<WebSocket>();
     roomSockets.add(socket);
     socketsByRoom.set(room.id, roomSockets);
+    socketUserByConnection.set(socket, userId);
 
     sendWs(socket, {
       type: "welcome",
@@ -922,6 +1008,15 @@ app.register(async (wsApp) => {
       roomSocketSet.delete(socket);
       if (roomSocketSet.size === 0) {
         socketsByRoom.delete(room.id);
+      }
+
+      if (hasOpenSocketForUser(room.id, userId, socket)) {
+        return;
+      }
+
+      const didLeave = removeMemberFromRoom(room, userId);
+      if (didLeave) {
+        broadcastRoomState(room, request, userId, "leave");
       }
     });
   });
