@@ -28,6 +28,7 @@ type Room = {
   creatorId: string;
   inviteToken: string;
   members: Set<string>;
+  memberProfiles: Map<string, MemberProfile>;
   playback: PlaybackState;
   createdAtMs: number;
   revision: number;
@@ -35,10 +36,16 @@ type Room = {
   activeControllerUntilMs: number;
 };
 
+type MemberProfile = {
+  userId: string;
+  nickname: string;
+};
+
 type ChatMessage = {
   id: string;
   roomId: string;
   userId: string;
+  userDisplayName?: string;
   message: string;
   createdAtMs: number;
   replyToMessageId?: string;
@@ -75,6 +82,11 @@ type WsClientMessage =
       type: "sync";
     }
   | {
+      type: "profile";
+      action: "setNickname";
+      nickname: string;
+    }
+  | {
       type: "ping";
     };
 
@@ -87,8 +99,15 @@ type WsServerMessage =
   | {
       type: "room_state";
       room: RoomResponse;
-      reason: "join" | "leave" | "playback" | "video_change" | "sync";
+      reason:
+        | "join"
+        | "leave"
+        | "playback"
+        | "video_change"
+        | "sync"
+        | "nickname_change";
       byUserId: string;
+      byDisplayName?: string;
       action?: PlaybackAction;
     }
   | {
@@ -111,6 +130,7 @@ type RoomResponse = {
   inviteToken: string;
   shareUrl: string;
   memberCount: number;
+  members: MemberProfile[];
   revision: number;
   playback: PlaybackState;
 };
@@ -239,26 +259,70 @@ const playbackSummary = (playback: PlaybackState): string => {
   return `${playback.playbackTimeSec.toFixed(2)}s (${minutes}m)`;
 };
 
+const normalizeNickname = (value: string | undefined): string | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return trimmed.slice(0, 32);
+};
+
+const getMemberProfile = (room: Room, userId: string): MemberProfile => {
+  const existing = room.memberProfiles.get(userId);
+  if (existing) {
+    return existing;
+  }
+  const fallback = { userId, nickname: userId };
+  room.memberProfiles.set(userId, fallback);
+  return fallback;
+};
+
+const getDisplayNameForUser = (room: Room, userId: string): string =>
+  getMemberProfile(room, userId).nickname;
+
+const setNicknameForUser = (
+  room: Room,
+  userId: string,
+  nickname: string,
+): "updated" | "unchanged" | "invalid" => {
+  const nextNickname = normalizeNickname(nickname);
+  if (!nextNickname) {
+    return "invalid";
+  }
+  const current = getMemberProfile(room, userId);
+  if (current.nickname === nextNickname) {
+    return "unchanged";
+  }
+  room.memberProfiles.set(userId, {
+    userId,
+    nickname: nextNickname,
+  });
+  return "updated";
+};
+
 const toPlaybackChatMessage = (
   action: PlaybackAction,
-  userId: string,
+  userDisplayName: string,
   playback: PlaybackState,
 ): string => {
   if (action === "play") {
-    return `${userId} resumed video at ${playbackSummary(playback)}.`;
+    return `${userDisplayName} resumed video at ${playbackSummary(playback)}.`;
   }
   if (action === "pause") {
-    return `${userId} paused video at ${playbackSummary(playback)}.`;
+    return `${userDisplayName} paused video at ${playbackSummary(playback)}.`;
   }
   if (action === "seek") {
-    return `${userId} seeked to ${playbackSummary(playback)}.`;
+    return `${userDisplayName} seeked to ${playbackSummary(playback)}.`;
   }
-  return `${userId} changed video to ${playback.videoId}.`;
+  return `${userDisplayName} changed video to ${playback.videoId}.`;
 };
 
 type WsRouteRequestLike = {
   params?: { roomId?: string };
-  query?: { userId?: string; inviteToken?: string };
+  query?: { userId?: string; inviteToken?: string; nickname?: string };
   url?: string;
   raw?: { url?: string };
 };
@@ -286,6 +350,7 @@ const getWsRoomId = (request: WsRouteRequestLike): string | null => {
 const getWsQuery = (request: WsRouteRequestLike): {
   userId?: string;
   inviteToken?: string;
+  nickname?: string;
 } => {
   if (request.query) {
     return request.query;
@@ -296,7 +361,8 @@ const getWsQuery = (request: WsRouteRequestLike): {
   const params = new URLSearchParams(rawQuery);
   const userId = params.get("userId") ?? undefined;
   const inviteToken = params.get("inviteToken") ?? undefined;
-  return { userId, inviteToken };
+  const nickname = params.get("nickname") ?? undefined;
+  return { userId, inviteToken, nickname };
 };
 
 const normalizePlayback = (playback: PlaybackState): PlaybackState => {
@@ -395,12 +461,16 @@ const getVideoById = async (videoId: string): Promise<VideoItem | null> => {
 const roomResponse = (room: Room, request?: RequestLike): RoomResponse => {
   const baseUrl = request ? getBaseUrl(request) : getServerBaseUrl();
   const shareUrl = `${baseUrl}/room/${room.id}?token=${room.inviteToken}`;
+  const members = [...room.members]
+    .map((userId) => getMemberProfile(room, userId))
+    .sort((a, b) => a.nickname.localeCompare(b.nickname));
   return {
     roomId: room.id,
     creatorId: room.creatorId,
     inviteToken: room.inviteToken,
     shareUrl,
     memberCount: room.members.size,
+    members,
     revision: room.revision,
     playback: room.playback,
   };
@@ -417,9 +487,16 @@ const broadcastRoomState = (
   room: Room,
   request: RequestLike | undefined,
   byUserId: string,
-  reason: "join" | "leave" | "playback" | "video_change" | "sync",
+  reason:
+    | "join"
+    | "leave"
+    | "playback"
+    | "video_change"
+    | "sync"
+    | "nickname_change",
   action?: PlaybackAction,
   excludeSocket?: WebSocket,
+  byDisplayName?: string,
 ): void => {
   const roomSockets = socketsByRoom.get(room.id);
   if (!roomSockets || roomSockets.size === 0) {
@@ -431,6 +508,7 @@ const broadcastRoomState = (
     room: roomResponse(room, request),
     reason,
     byUserId,
+    byDisplayName: byDisplayName ?? getDisplayNameForUser(room, byUserId),
     action,
   };
 
@@ -462,7 +540,11 @@ const flushPendingPlaybackBurst = (roomId: string, userId: string): void => {
       id: newId(),
       roomId: room.id,
       userId: "system",
-      message: toPlaybackChatMessage(event.action, userId, playback),
+      message: toPlaybackChatMessage(
+        event.action,
+        getDisplayNameForUser(room, userId),
+        playback,
+      ),
       createdAtMs: nowMs(),
     };
     roomMessages.push(playbackLogMessage);
@@ -555,6 +637,7 @@ const removeMemberFromRoom = (room: Room, userId: string): boolean => {
   }
 
   room.members.delete(userId);
+  room.memberProfiles.delete(userId);
   if (room.activeControllerId === userId) {
     room.activeControllerId = null;
     room.activeControllerUntilMs = 0;
@@ -753,9 +836,10 @@ app.post<{
   Body: {
     creatorId: string;
     videoId: string;
+    creatorNickname?: string;
   };
 }>("/rooms/from-video", async (request, reply) => {
-  const { creatorId, videoId } = request.body;
+  const { creatorId, videoId, creatorNickname } = request.body;
   const video = await getVideoById(videoId);
   if (!video) {
     reply.code(404);
@@ -767,6 +851,15 @@ app.post<{
     creatorId,
     inviteToken: newId(),
     members: new Set([creatorId]),
+    memberProfiles: new Map([
+      [
+        creatorId,
+        {
+          userId: creatorId,
+          nickname: normalizeNickname(creatorNickname) ?? creatorId,
+        },
+      ],
+    ]),
     playback: {
       videoId: video.id,
       videoUrl: video.streamPath,
@@ -816,9 +909,18 @@ app.post<{
     return { error: "invalid_invite_token" };
   }
 
+  const displayNameBeforeLeave = getDisplayNameForUser(room, trimmedUserId);
   const didLeave = removeMemberFromRoom(room, trimmedUserId);
   if (didLeave) {
-    broadcastRoomState(room, request, trimmedUserId, "leave");
+    broadcastRoomState(
+      room,
+      request,
+      trimmedUserId,
+      "leave",
+      undefined,
+      undefined,
+      displayNameBeforeLeave,
+    );
   }
 
   const roomSockets = socketsByRoom.get(room.id);
@@ -848,10 +950,11 @@ app.register(async (wsApp) => {
     Querystring: {
       userId?: string;
       inviteToken?: string;
+      nickname?: string;
     };
   }>("/rooms/:roomId/ws", { websocket: true }, (socket, request): void => {
     const roomId = getWsRoomId(request);
-    const { userId, inviteToken } = getWsQuery(request);
+    const { userId, inviteToken, nickname } = getWsQuery(request);
 
     if (!roomId) {
       sendWs(socket, { type: "error", error: "room_not_found" });
@@ -889,6 +992,16 @@ app.register(async (wsApp) => {
     );
 
     room.members.add(userId);
+    if (nickname) {
+      const setResult = setNicknameForUser(room, userId, nickname);
+      if (setResult === "invalid") {
+        sendWs(socket, { type: "error", error: "invalid_nickname" });
+        socket.close();
+        return;
+      }
+    } else {
+      getMemberProfile(room, userId);
+    }
     room.playback = normalizePlayback(room.playback);
     room.revision += 1;
 
@@ -925,6 +1038,34 @@ app.register(async (wsApp) => {
           room: roomResponse(room, request),
           reason: "sync",
           byUserId: userId,
+          byDisplayName: getDisplayNameForUser(room, userId),
+        });
+        return;
+      }
+
+      if (payload.type === "profile") {
+        if (payload.action !== "setNickname") {
+          sendWs(socket, { type: "error", error: "invalid_profile_action" });
+          return;
+        }
+
+        const setResult = setNicknameForUser(room, userId, payload.nickname);
+        if (setResult === "invalid") {
+          sendWs(socket, { type: "error", error: "invalid_nickname" });
+          return;
+        }
+        if (setResult === "unchanged") {
+          return;
+        }
+
+        room.revision += 1;
+        broadcastRoomState(room, request, userId, "nickname_change", undefined, socket);
+        sendWs(socket, {
+          type: "room_state",
+          room: roomResponse(room, request),
+          reason: "nickname_change",
+          byUserId: userId,
+          byDisplayName: getDisplayNameForUser(room, userId),
         });
         return;
       }
@@ -1010,7 +1151,11 @@ app.register(async (wsApp) => {
             id: newId(),
             roomId: room.id,
             userId: "system",
-            message: toPlaybackChatMessage(payload.action, userId, room.playback),
+            message: toPlaybackChatMessage(
+              payload.action,
+              getDisplayNameForUser(room, userId),
+              room.playback,
+            ),
             createdAtMs: nowMs(),
           };
           roomMessages.push(playbackLogMessage);
@@ -1070,6 +1215,7 @@ app.register(async (wsApp) => {
           id: newId(),
           roomId: room.id,
           userId,
+          userDisplayName: getDisplayNameForUser(room, userId),
           message: trimmed,
           createdAtMs: nowMs(),
           ...(replyToMessageId ? { replyToMessageId } : {}),
@@ -1121,9 +1267,18 @@ app.register(async (wsApp) => {
         return;
       }
 
+      const displayNameBeforeLeave = getDisplayNameForUser(room, userId);
       const didLeave = removeMemberFromRoom(room, userId);
       if (didLeave) {
-        broadcastRoomState(room, request, userId, "leave");
+        broadcastRoomState(
+          room,
+          request,
+          userId,
+          "leave",
+          undefined,
+          undefined,
+          displayNameBeforeLeave,
+        );
       }
     });
   });

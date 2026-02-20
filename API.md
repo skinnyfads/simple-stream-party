@@ -85,6 +85,7 @@ Body:
 ```json
 {
   "creatorId": "alice",
+  "creatorNickname": "Alice",
   "videoId": "ZXhhbXBsZS5tcDQ"
 }
 ```
@@ -98,6 +99,7 @@ Response (`201`):
   "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
   "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
   "memberCount": 1,
+  "members": [{ "userId": "alice", "nickname": "Alice" }],
   "revision": 1,
   "playback": {
     "videoId": "ZXhhbXBsZS5tcDQ",
@@ -115,7 +117,7 @@ Possible errors:
 
 ## 5) Room WebSocket
 
-### `GET /rooms/:roomId/ws?userId=...&inviteToken=...`
+### `GET /rooms/:roomId/ws?userId=...&inviteToken=...&nickname=...`
 
 Open a WebSocket connection to join the room and receive real-time updates.
 
@@ -123,9 +125,11 @@ Example:
 
 ```js
 const ws = new WebSocket(
-  `ws://localhost:3000/rooms/${roomId}/ws?userId=${encodeURIComponent(userId)}&inviteToken=${encodeURIComponent(token)}`,
+  `ws://localhost:3000/rooms/${roomId}/ws?userId=${encodeURIComponent(userId)}&inviteToken=${encodeURIComponent(token)}&nickname=${encodeURIComponent("Alice")}`,
 );
 ```
+
+`nickname` is optional (max 32 chars). If omitted, it defaults to `userId`.
 
 Connection errors are sent as WebSocket messages then the socket is closed:
 
@@ -138,6 +142,7 @@ Possible connection errors:
 - `room_not_found`
 - `missing_user_id`
 - `invalid_invite_token`
+- `invalid_nickname`
 
 ## 6) Leave Room
 
@@ -165,6 +170,7 @@ Response (`200`):
     "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
     "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
     "memberCount": 1,
+    "members": [{ "userId": "alice", "nickname": "Alice" }],
     "revision": 9,
     "playback": {
       "videoId": "ZXhhbXBsZS5tcDQ",
@@ -215,6 +221,17 @@ Possible playback errors:
 - `missing_video_id`
 - `video_not_found`
 
+### Update nickname
+
+```json
+{ "type": "profile", "action": "setNickname", "nickname": "Alice Cooper" }
+```
+
+Possible profile errors:
+
+- `invalid_profile_action`
+- `invalid_nickname`
+
 ### Chat message
 
 ```json
@@ -262,6 +279,10 @@ Possible error:
     "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
     "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
     "memberCount": 2,
+    "members": [
+      { "userId": "alice", "nickname": "Alice" },
+      { "userId": "bob", "nickname": "Bobby" }
+    ],
     "revision": 5,
     "playback": {
       "videoId": "ZXhhbXBsZS5tcDQ",
@@ -282,6 +303,7 @@ Possible error:
   "type": "room_state",
   "reason": "playback",
   "byUserId": "bob",
+  "byDisplayName": "Bobby",
   "action": "seek",
   "room": {
     "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
@@ -290,6 +312,10 @@ Possible error:
     "inviteToken": "a3ecac17-f084-428b-a6bc-778899001122",
     "shareUrl": "http://localhost:3000/room/c2d6b6c2-3f1f-49f1-9f8f-112233445566?token=a3ecac17-f084-428b-a6bc-778899001122",
     "memberCount": 2,
+    "members": [
+      { "userId": "alice", "nickname": "Alice" },
+      { "userId": "bob", "nickname": "Bobby" }
+    ],
     "playback": {
       "videoId": "ZXhhbXBsZS5tcDQ",
       "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
@@ -301,6 +327,8 @@ Possible error:
 }
 ```
 
+`byDisplayName` is optional.
+
 `reason` values:
 
 - `join`
@@ -308,6 +336,7 @@ Possible error:
 - `playback`
 - `video_change`
 - `sync`
+- `nickname_change`
 
 ### Chat event
 
@@ -319,6 +348,7 @@ Possible error:
     "id": "e15f7ab7-a54a-4f24-a7b8-001122334455",
     "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
     "userId": "bob",
+    "userDisplayName": "Bobby",
     "message": "hello everyone",
     "createdAtMs": 1739720050000,
     "replyToMessageId": "5f4f4c8d-8e9d-4e7e-8a1d-889900112233"
@@ -327,6 +357,7 @@ Possible error:
 ```
 
 `replyToMessageId` is optional and only present when the message is a reply.
+`userDisplayName` is optional.
 
 ### Pong
 
@@ -339,12 +370,13 @@ Possible error:
 1. Call `GET /videos` and render a selectable list.
 2. Call `POST /rooms/from-video` when a video is selected.
 3. Copy/share `shareUrl` (contains room id + token).
-4. Connect WebSocket to `/rooms/:roomId/ws?userId=...&inviteToken=...`.
+4. Connect WebSocket to `/rooms/:roomId/ws?userId=...&inviteToken=...&nickname=...`.
 5. On `welcome`, load `room.playback.videoUrl` and initial message list.
 6. Send `playback` messages when the user interacts with player controls.
 7. Apply updates from `room_state` events.
 8. Send/receive chat through `chat` and `chat_message` events.
-9. When a user leaves intentionally, call `POST /rooms/:roomId/leave`.
+9. Send `profile:setNickname` when user updates display name.
+10. When a user leaves intentionally, call `POST /rooms/:roomId/leave`.
 
 ## Notes
 
