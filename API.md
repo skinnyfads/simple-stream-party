@@ -404,9 +404,26 @@ Possible error:
       }
     }
   },
-  "messages": []
+  "messages": [],
+  "playbackActivities": [
+    {
+      "id": "8b55dcfe-6df3-4d1c-8ff6-001122334455",
+      "roomId": "c2d6b6c2-3f1f-49f1-9f8f-112233445566",
+      "userId": "bob",
+      "userDisplayName": "Bobby",
+      "action": "seek",
+      "playbackTimeSec": 44.2,
+      "isPlaying": false,
+      "videoId": "ZXhhbXBsZS5tcDQ",
+      "createdAtMs": 1739720044200,
+      "revision": 6
+    }
+  ]
 }
 ```
+
+`playbackActivities` contains recent playback timeline entries for the room
+(up to 200), so clients can rebuild activity UI after reconnect/refresh.
 
 ### Room state update
 

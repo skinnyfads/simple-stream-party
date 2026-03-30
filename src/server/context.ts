@@ -5,6 +5,7 @@ import { createRoomPlaybackState } from "./room-playback-state.js";
 import type {
   ChatMessage,
   MemberProfile,
+  PlaybackActivity,
   PlaybackAction,
   PlaybackState,
   RequestLike,
@@ -21,6 +22,7 @@ import type {
 export type ServerContext = {
   rooms: Map<string, Room>;
   chatByRoom: Map<string, ChatMessage[]>;
+  playbackActivitiesByRoom: Map<string, PlaybackActivity[]>;
   socketsByRoom: Map<string, Set<WsConnection>>;
   socketUserByConnection: WeakMap<WsConnection, string>;
   recentPauseByRoomUser: Map<string, number>;
@@ -101,6 +103,12 @@ export type ServerContext = {
     subtitleLanguage?: string,
   ) => Promise<{ ok: true; changed: boolean } | { ok: false; error: string }>;
   acquireControlLease: (room: Room, userId: string) => boolean;
+  appendPlaybackActivity: (
+    room: Room,
+    userId: string,
+    action: PlaybackAction,
+  ) => PlaybackActivity;
+  listPlaybackActivities: (roomId: string) => PlaybackActivity[];
 };
 
 export const createServerContext = (): ServerContext => {
@@ -110,6 +118,7 @@ export const createServerContext = (): ServerContext => {
   const media = createMediaHelpers();
   const roomPlayback = createRoomPlaybackState({
     nowMs,
+    newId,
     getVideoById: media.getVideoById,
     getSubtitleById: media.getSubtitleById,
     resolveBaseUrl: (request?: RequestLike) =>
@@ -119,6 +128,7 @@ export const createServerContext = (): ServerContext => {
   return {
     rooms: roomPlayback.rooms,
     chatByRoom: roomPlayback.chatByRoom,
+    playbackActivitiesByRoom: roomPlayback.playbackActivitiesByRoom,
     socketsByRoom: roomPlayback.socketsByRoom,
     socketUserByConnection: roomPlayback.socketUserByConnection,
     recentPauseByRoomUser: roomPlayback.recentPauseByRoomUser,
@@ -158,5 +168,7 @@ export const createServerContext = (): ServerContext => {
     removeMemberFromRoom: roomPlayback.removeMemberFromRoom,
     applyPlaybackAction: roomPlayback.applyPlaybackAction,
     acquireControlLease: roomPlayback.acquireControlLease,
+    appendPlaybackActivity: roomPlayback.appendPlaybackActivity,
+    listPlaybackActivities: roomPlayback.listPlaybackActivities,
   };
 };

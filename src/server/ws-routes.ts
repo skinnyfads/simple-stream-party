@@ -133,6 +133,7 @@ export const registerWsRoutes = (
         type: "welcome",
         room: context.roomResponse(room, request),
         messages: context.chatByRoom.get(room.id) ?? [],
+        playbackActivities: context.listPlaybackActivities(room.id),
       });
       context.broadcastRoomState(
         room,
@@ -334,6 +335,7 @@ export const registerWsRoutes = (
             },
             "Playback action applied",
           );
+          context.appendPlaybackActivity(room, userId, payload.action);
 
           if (payload.action === "changeVideo") {
             context.sendRoomStateToSocket(

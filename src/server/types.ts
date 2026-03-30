@@ -53,6 +53,19 @@ export type ChatMessage = {
   replyToMessageId?: string;
 };
 
+export type PlaybackActivity = {
+  id: string;
+  roomId: string;
+  userId: string;
+  userDisplayName?: string;
+  action: PlaybackAction;
+  playbackTimeSec: number;
+  isPlaying: boolean;
+  videoId: string;
+  createdAtMs: number;
+  revision: number;
+};
+
 export type VideoItem = {
   id: string;
   fileName: string;
@@ -132,6 +145,7 @@ export type WsServerMessage =
       type: "welcome";
       room: RoomResponse;
       messages: ChatMessage[];
+      playbackActivities: PlaybackActivity[];
     }
   | {
       type: "room_state";

@@ -219,6 +219,7 @@ export const registerHttpRoutes = (
 
     context.rooms.set(room.id, room);
     context.chatByRoom.set(room.id, []);
+    context.playbackActivitiesByRoom.set(room.id, []);
 
     reply.code(201);
     return context.roomResponse(room, request);

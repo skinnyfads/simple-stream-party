@@ -6,6 +6,7 @@ import { dedupePlaybackBurst } from "../playback-dedupe.js";
 import type {
   ChatMessage,
   MemberProfile,
+  PlaybackActivity,
   PlaybackAction,
   PlaybackState,
   RequestLike,
@@ -34,6 +35,7 @@ type PendingPlaybackBurst = {
 export type RoomPlaybackState = {
   rooms: Map<string, Room>;
   chatByRoom: Map<string, ChatMessage[]>;
+  playbackActivitiesByRoom: Map<string, PlaybackActivity[]>;
   socketsByRoom: Map<string, Set<WsConnection>>;
   socketUserByConnection: WeakMap<WsConnection, string>;
   recentPauseByRoomUser: Map<string, number>;
@@ -94,10 +96,17 @@ export type RoomPlaybackState = {
     subtitleLanguage?: string,
   ) => Promise<{ ok: true; changed: boolean } | { ok: false; error: string }>;
   acquireControlLease: (room: Room, userId: string) => boolean;
+  appendPlaybackActivity: (
+    room: Room,
+    userId: string,
+    action: PlaybackAction,
+  ) => PlaybackActivity;
+  listPlaybackActivities: (roomId: string) => PlaybackActivity[];
 };
 
 type CreateRoomPlaybackStateArgs = {
   nowMs: () => number;
+  newId: () => string;
   getVideoById: (videoId: string) => Promise<VideoItem | null>;
   getSubtitleById: (subtitleId: string) => Promise<{
     fileName: string;
@@ -111,6 +120,7 @@ export const createRoomPlaybackState = (
 ): RoomPlaybackState => {
   const rooms = new Map<string, Room>();
   const chatByRoom = new Map<string, ChatMessage[]>();
+  const playbackActivitiesByRoom = new Map<string, PlaybackActivity[]>();
   const socketsByRoom = new Map<string, Set<WsConnection>>();
   const socketUserByConnection = new WeakMap<WsConnection, string>();
   const pendingPlaybackBurstsByRoomUser = new Map<
@@ -124,6 +134,7 @@ export const createRoomPlaybackState = (
   const PLAYBACK_SYNC_INTERVAL_MS = 2000;
   const PLAYBACK_DEDUPE_WINDOW_MS = 250;
   const SEEK_PAUSE_NOISE_WINDOW_MS = 500;
+  const MAX_PLAYBACK_ACTIVITY_HISTORY = 200;
 
   const playbackSummary = (playback: PlaybackState): string => {
     const minutes = (playback.playbackTimeSec / 60).toFixed(2);
@@ -586,6 +597,37 @@ export const createRoomPlaybackState = (
     return false;
   };
 
+  const appendPlaybackActivity = (
+    room: Room,
+    userId: string,
+    action: PlaybackAction,
+  ): PlaybackActivity => {
+    const activity: PlaybackActivity = {
+      id: args.newId(),
+      roomId: room.id,
+      userId,
+      userDisplayName: getDisplayNameForUser(room, userId),
+      action,
+      playbackTimeSec: room.playback.playbackTimeSec,
+      isPlaying: room.playback.isPlaying,
+      videoId: room.playback.videoId,
+      createdAtMs: args.nowMs(),
+      revision: room.revision,
+    };
+
+    const roomActivities = playbackActivitiesByRoom.get(room.id) ?? [];
+    roomActivities.push(activity);
+    if (roomActivities.length > MAX_PLAYBACK_ACTIVITY_HISTORY) {
+      roomActivities.shift();
+    }
+    playbackActivitiesByRoom.set(room.id, roomActivities);
+    return activity;
+  };
+
+  const listPlaybackActivities = (roomId: string): PlaybackActivity[] => [
+    ...(playbackActivitiesByRoom.get(roomId) ?? []),
+  ];
+
   const periodicPlaybackSync = setInterval(() => {
     const currentMs = args.nowMs();
     for (const [roomId, roomSockets] of socketsByRoom.entries()) {
@@ -624,6 +666,7 @@ export const createRoomPlaybackState = (
   return {
     rooms,
     chatByRoom,
+    playbackActivitiesByRoom,
     socketsByRoom,
     socketUserByConnection,
     recentPauseByRoomUser,
@@ -646,5 +689,7 @@ export const createRoomPlaybackState = (
     removeMemberFromRoom,
     applyPlaybackAction,
     acquireControlLease,
+    appendPlaybackActivity,
+    listPlaybackActivities,
   };
 };
