@@ -13,7 +13,21 @@ import {
 } from "./playback-dedupe.js";
 import type { RawData, WebSocket } from "ws";
 
-type PlaybackAction = "play" | "pause" | "seek" | "changeVideo";
+type PlaybackAction =
+  | "play"
+  | "pause"
+  | "seek"
+  | "changeVideo"
+  | "changeSubtitle";
+
+type SubtitleSource = "local" | "link";
+
+type SubtitleState = {
+  source: SubtitleSource;
+  trackUrl: string;
+  label: string;
+  language?: string;
+};
 
 type PlaybackState = {
   videoId: string;
@@ -21,6 +35,7 @@ type PlaybackState = {
   playbackTimeSec: number;
   isPlaying: boolean;
   lastUpdatedAtMs: number;
+  subtitle: SubtitleState | null;
 };
 
 type Room = {
@@ -59,6 +74,17 @@ type VideoItem = {
   streamPath: string;
 };
 
+type SubtitleFormat = "vtt" | "srt";
+
+type SubtitleItem = {
+  id: string;
+  fileName: string;
+  sizeBytes: number;
+  modifiedAtMs: number;
+  trackPath: string;
+  format: SubtitleFormat;
+};
+
 type RequestLike = {
   protocol: string;
   hostname: string;
@@ -72,6 +98,10 @@ type WsClientMessage =
       action: PlaybackAction;
       atTimeSec?: number;
       videoId?: string;
+      subtitleId?: string;
+      subtitleUrl?: string;
+      subtitleLabel?: string;
+      subtitleLanguage?: string;
     }
   | {
       type: "chat";
@@ -99,13 +129,7 @@ type WsServerMessage =
   | {
       type: "room_state";
       room: RoomResponse;
-      reason:
-        | "join"
-        | "leave"
-        | "playback"
-        | "video_change"
-        | "sync"
-        | "nickname_change";
+      reason: RoomStateReason;
       byUserId: string;
       byDisplayName?: string;
       action?: PlaybackAction;
@@ -123,6 +147,15 @@ type WsServerMessage =
       type: "error";
       error: string;
     };
+
+type RoomStateReason =
+  | "join"
+  | "leave"
+  | "playback"
+  | "video_change"
+  | "subtitle_change"
+  | "sync"
+  | "nickname_change";
 
 type RoomResponse = {
   roomId: string;
@@ -161,18 +194,24 @@ app.register(cors, {
 });
 
 const VIDEO_EXTENSIONS = new Set([".mp4", ".webm", ".mkv", ".mov", ".m4v"]);
+const SUBTITLE_EXTENSIONS = new Set([".vtt", ".srt"]);
 const dataDir = path.resolve(process.cwd(), env.DATA_DIR);
+const subtitlesDir = path.join(dataDir, "subtitles");
 const SEEK_EPSILON_SEC = 1;
 const CONTROL_LEASE_MS = 2000;
 const PLAYBACK_SYNC_INTERVAL_MS = 2000;
 const PLAYBACK_DEDUPE_WINDOW_MS = 250;
 const SEEK_PAUSE_NOISE_WINDOW_MS = 500;
+const MAX_SUBTITLE_UPLOAD_BYTES = 2 * 1024 * 1024;
 
 const nowMs = (): number => Date.now();
 
 const newId = (): string => crypto.randomUUID();
 
 const toVideoId = (fileName: string): string =>
+  Buffer.from(fileName).toString("base64url");
+
+const toSubtitleId = (fileName: string): string =>
   Buffer.from(fileName).toString("base64url");
 
 const fromVideoId = (videoId: string): string | null => {
@@ -183,8 +222,19 @@ const fromVideoId = (videoId: string): string | null => {
   }
 };
 
+const fromSubtitleId = (subtitleId: string): string | null => {
+  try {
+    return Buffer.from(subtitleId, "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+};
+
 const streamPathForVideoId = (videoId: string): string =>
   `/videos/${videoId}/stream`;
+
+const trackPathForSubtitleId = (subtitleId: string): string =>
+  `/subtitles/${subtitleId}/track`;
 
 const contentTypeForVideo = (fileName: string): string => {
   const ext = path.extname(fileName).toLowerCase();
@@ -201,6 +251,34 @@ const contentTypeForVideo = (fileName: string): string => {
     return "video/x-m4v";
   }
   return "video/mp4";
+};
+
+const subtitleFormatForFileName = (fileName: string): SubtitleFormat | null => {
+  const ext = path.extname(fileName).toLowerCase();
+  if (ext === ".vtt") {
+    return "vtt";
+  }
+  if (ext === ".srt") {
+    return "srt";
+  }
+  return null;
+};
+
+const ensureVttHeader = (content: string): string => {
+  const normalized = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+  if (normalized.startsWith("WEBVTT")) {
+    return normalized;
+  }
+  return `WEBVTT\n\n${normalized}`;
+};
+
+const convertSrtToVtt = (srtContent: string): string => {
+  const normalized = srtContent.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+  const withVttTimestamps = normalized.replace(
+    /\b(\d{2}:\d{2}:\d{2}),(\d{3})\b/g,
+    "$1.$2",
+  );
+  return ensureVttHeader(withVttTimestamps);
 };
 
 const parseSingleRange = (
@@ -289,6 +367,83 @@ const normalizeNickname = (value: string | undefined): string | undefined => {
   return trimmed.slice(0, 32);
 };
 
+const normalizeSubtitleLabel = (
+  value: string | undefined,
+): string | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return trimmed.slice(0, 64);
+};
+
+const normalizeSubtitleLanguage = (
+  value: string | undefined,
+): string | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) {
+    return undefined;
+  }
+  return trimmed.slice(0, 16);
+};
+
+const normalizeExternalSubtitleUrl = (
+  value: string | undefined,
+): string | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith("/")) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+};
+
+const toSafeSubtitleFileName = (value: string): string | null => {
+  const base = path.basename(value).trim();
+  if (!base) {
+    return null;
+  }
+  const sanitized = base.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return sanitized || null;
+};
+
+const isSameSubtitleState = (
+  left: SubtitleState | null,
+  right: SubtitleState | null,
+): boolean => {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return false;
+  }
+  return (
+    left.source === right.source &&
+    left.trackUrl === right.trackUrl &&
+    left.label === right.label &&
+    left.language === right.language
+  );
+};
+
 const getMemberProfile = (room: Room, userId: string): MemberProfile => {
   const existing = room.memberProfiles.get(userId);
   if (existing) {
@@ -349,7 +504,9 @@ const getWsRoomId = (request: WsRouteRequestLike): string | null => {
   }
 };
 
-const getWsQuery = (request: WsRouteRequestLike): {
+const getWsQuery = (
+  request: WsRouteRequestLike,
+): {
   userId?: string;
   inviteToken?: string;
   nickname?: string;
@@ -460,6 +617,109 @@ const getVideoById = async (videoId: string): Promise<VideoItem | null> => {
   }
 };
 
+const listSubtitles = async (): Promise<SubtitleItem[]> => {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fsp.readdir(subtitlesDir, { withFileTypes: true });
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+
+  const files = entries.filter((entry) => entry.isFile());
+  const subtitles: SubtitleItem[] = [];
+
+  for (const file of files) {
+    const ext = path.extname(file.name).toLowerCase();
+    if (!SUBTITLE_EXTENSIONS.has(ext)) {
+      continue;
+    }
+
+    const format = subtitleFormatForFileName(file.name);
+    if (!format) {
+      continue;
+    }
+
+    const fullPath = path.join(subtitlesDir, file.name);
+    const stat = await fsp.stat(fullPath);
+    const id = toSubtitleId(file.name);
+
+    subtitles.push({
+      id,
+      fileName: file.name,
+      sizeBytes: stat.size,
+      modifiedAtMs: stat.mtimeMs,
+      trackPath: trackPathForSubtitleId(id),
+      format,
+    });
+  }
+
+  subtitles.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
+  return subtitles;
+};
+
+const getSubtitleById = async (
+  subtitleId: string,
+): Promise<SubtitleItem | null> => {
+  const fileName = fromSubtitleId(subtitleId);
+  if (!fileName) {
+    return null;
+  }
+
+  const fullPath = path.join(subtitlesDir, fileName);
+  const normalized = path.normalize(fullPath);
+  if (
+    !normalized.startsWith(subtitlesDir + path.sep) &&
+    normalized !== subtitlesDir
+  ) {
+    return null;
+  }
+
+  const ext = path.extname(fileName).toLowerCase();
+  if (!SUBTITLE_EXTENSIONS.has(ext)) {
+    return null;
+  }
+
+  const format = subtitleFormatForFileName(fileName);
+  if (!format) {
+    return null;
+  }
+
+  try {
+    const stat = await fsp.stat(fullPath);
+    if (!stat.isFile()) {
+      return null;
+    }
+
+    return {
+      id: subtitleId,
+      fileName,
+      sizeBytes: stat.size,
+      modifiedAtMs: stat.mtimeMs,
+      trackPath: trackPathForSubtitleId(subtitleId),
+      format,
+    };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+};
+
+const readSubtitleAsVtt = async (subtitle: SubtitleItem): Promise<string> => {
+  const fullPath = path.join(subtitlesDir, subtitle.fileName);
+  const content = await fsp.readFile(fullPath, "utf8");
+  if (subtitle.format === "vtt") {
+    return ensureVttHeader(content);
+  }
+  return convertSrtToVtt(content);
+};
+
 const roomResponse = (room: Room, request?: RequestLike): RoomResponse => {
   const baseUrl = request ? getBaseUrl(request) : getServerBaseUrl();
   const shareUrl = `${baseUrl}/room/${room.id}?token=${room.inviteToken}`;
@@ -489,13 +749,7 @@ const broadcastRoomState = (
   room: Room,
   request: RequestLike | undefined,
   byUserId: string,
-  reason:
-    | "join"
-    | "leave"
-    | "playback"
-    | "video_change"
-    | "sync"
-    | "nickname_change",
+  reason: RoomStateReason,
   action?: PlaybackAction,
   excludeSocket?: WebSocket,
   byDisplayName?: string,
@@ -527,13 +781,7 @@ const sendRoomStateToSocket = (
   room: Room,
   request: RequestLike | undefined,
   byUserId: string,
-  reason:
-    | "join"
-    | "leave"
-    | "playback"
-    | "video_change"
-    | "sync"
-    | "nickname_change",
+  reason: RoomStateReason,
   action?: PlaybackAction,
 ): void => {
   sendWs(socket, {
@@ -561,7 +809,14 @@ const flushPendingPlaybackBurst = (roomId: string, userId: string): void => {
   for (const event of dedupedEvents) {
     const { room, request, excludeSocket } = event.meta;
 
-    broadcastRoomState(room, request, userId, "playback", event.action, excludeSocket);
+    broadcastRoomState(
+      room,
+      request,
+      userId,
+      "playback",
+      event.action,
+      excludeSocket,
+    );
   }
 };
 
@@ -691,10 +946,11 @@ const applyPlaybackAction = async (
   action: PlaybackAction,
   atTimeSec?: number,
   videoId?: string,
-): Promise<
-  | { ok: true; changed: boolean }
-  | { ok: false; error: string }
-> => {
+  subtitleId?: string,
+  subtitleUrl?: string,
+  subtitleLabel?: string,
+  subtitleLanguage?: string,
+): Promise<{ ok: true; changed: boolean } | { ok: false; error: string }> => {
   const playback = normalizePlayback(room.playback);
   const currentMs = nowMs();
   let changed = false;
@@ -751,6 +1007,51 @@ const applyPlaybackAction = async (
         videoUrl: video.streamPath,
         playbackTimeSec: 0,
         isPlaying: false,
+        lastUpdatedAtMs: currentMs,
+        subtitle: null,
+      };
+      changed = true;
+    }
+  }
+
+  if (action === "changeSubtitle") {
+    if (subtitleId && subtitleUrl?.trim()) {
+      return { ok: false, error: "ambiguous_subtitle_source" };
+    }
+
+    const normalizedLabel = normalizeSubtitleLabel(subtitleLabel);
+    const normalizedLanguage = normalizeSubtitleLanguage(subtitleLanguage);
+
+    let nextSubtitle: SubtitleState | null = null;
+
+    if (subtitleId) {
+      const subtitle = await getSubtitleById(subtitleId);
+      if (!subtitle) {
+        return { ok: false, error: "subtitle_not_found" };
+      }
+      nextSubtitle = {
+        source: "local",
+        trackUrl: subtitle.trackPath,
+        label: normalizedLabel ?? subtitle.fileName,
+        language: normalizedLanguage,
+      };
+    } else if (subtitleUrl?.trim()) {
+      const normalizedSubtitleUrl = normalizeExternalSubtitleUrl(subtitleUrl);
+      if (!normalizedSubtitleUrl) {
+        return { ok: false, error: "invalid_subtitle_url" };
+      }
+      nextSubtitle = {
+        source: "link",
+        trackUrl: normalizedSubtitleUrl,
+        label: normalizedLabel ?? "External subtitle",
+        language: normalizedLanguage,
+      };
+    }
+
+    if (!isSameSubtitleState(playback.subtitle, nextSubtitle)) {
+      room.playback = {
+        ...playback,
+        subtitle: nextSubtitle,
         lastUpdatedAtMs: currentMs,
       };
       changed = true;
@@ -841,6 +1142,111 @@ app.get<{
   return reply.send(fs.createReadStream(fullPath, { start, end }));
 });
 
+app.get("/subtitles", async (request) => {
+  const subtitles = await listSubtitles();
+  const baseUrl = getBaseUrl(request);
+  return {
+    dataDir: subtitlesDir,
+    count: subtitles.length,
+    subtitles: subtitles.map((subtitle) => ({
+      id: subtitle.id,
+      fileName: subtitle.fileName,
+      sizeBytes: subtitle.sizeBytes,
+      modifiedAtMs: subtitle.modifiedAtMs,
+      format: subtitle.format,
+      trackUrl: `${baseUrl}${subtitle.trackPath}`,
+    })),
+  };
+});
+
+app.get<{
+  Params: { subtitleId: string };
+}>("/subtitles/:subtitleId/track", async (request, reply) => {
+  const { subtitleId } = request.params;
+  const subtitle = await getSubtitleById(subtitleId);
+  if (!subtitle) {
+    reply.code(404);
+    return { error: "subtitle_not_found" };
+  }
+
+  const vttTrack = await readSubtitleAsVtt(subtitle);
+  reply.header("Content-Type", "text/vtt; charset=utf-8");
+  reply.header("Cache-Control", "no-store");
+  return reply.send(vttTrack);
+});
+
+app.post<{
+  Body: {
+    fileName: string;
+    contentBase64: string;
+  };
+}>("/subtitles/upload", async (request, reply) => {
+  const safeFileName = toSafeSubtitleFileName(request.body.fileName);
+  if (!safeFileName) {
+    reply.code(400);
+    return { error: "invalid_subtitle_file_name" };
+  }
+
+  const format = subtitleFormatForFileName(safeFileName);
+  if (!format) {
+    reply.code(400);
+    return { error: "unsupported_subtitle_format" };
+  }
+
+  const rawBase64 = request.body.contentBase64?.trim();
+  if (!rawBase64) {
+    reply.code(400);
+    return { error: "missing_subtitle_content" };
+  }
+
+  let subtitleContent: Buffer;
+  try {
+    subtitleContent = Buffer.from(rawBase64, "base64");
+  } catch {
+    reply.code(400);
+    return { error: "invalid_subtitle_content" };
+  }
+
+  if (subtitleContent.length === 0) {
+    reply.code(400);
+    return { error: "invalid_subtitle_content" };
+  }
+
+  if (subtitleContent.length > MAX_SUBTITLE_UPLOAD_BYTES) {
+    reply.code(413);
+    return { error: "subtitle_too_large" };
+  }
+
+  const storedFileName = `${Date.now()}-${newId()}-${safeFileName}`;
+  const fullPath = path.join(subtitlesDir, storedFileName);
+  await fsp.mkdir(subtitlesDir, { recursive: true });
+  await fsp.writeFile(fullPath, subtitleContent);
+
+  const stat = await fsp.stat(fullPath);
+  const subtitleId = toSubtitleId(storedFileName);
+  const subtitle: SubtitleItem = {
+    id: subtitleId,
+    fileName: storedFileName,
+    sizeBytes: stat.size,
+    modifiedAtMs: stat.mtimeMs,
+    trackPath: trackPathForSubtitleId(subtitleId),
+    format,
+  };
+  const baseUrl = getBaseUrl(request);
+
+  reply.code(201);
+  return {
+    subtitle: {
+      id: subtitle.id,
+      fileName: subtitle.fileName,
+      sizeBytes: subtitle.sizeBytes,
+      modifiedAtMs: subtitle.modifiedAtMs,
+      format: subtitle.format,
+      trackUrl: `${baseUrl}${subtitle.trackPath}`,
+    },
+  };
+});
+
 app.post<{
   Body: {
     creatorId: string;
@@ -875,6 +1281,7 @@ app.post<{
       playbackTimeSec: 0,
       isPlaying: false,
       lastUpdatedAtMs: nowMs(),
+      subtitle: null,
     },
     createdAtMs: nowMs(),
     revision: 1,
@@ -1068,7 +1475,14 @@ app.register(async (wsApp) => {
         }
 
         room.revision += 1;
-        broadcastRoomState(room, request, userId, "nickname_change", undefined, socket);
+        broadcastRoomState(
+          room,
+          request,
+          userId,
+          "nickname_change",
+          undefined,
+          socket,
+        );
         sendWs(socket, {
           type: "room_state",
           room: roomResponse(room, request),
@@ -1103,6 +1517,10 @@ app.register(async (wsApp) => {
           payload.action,
           payload.atTimeSec,
           payload.videoId,
+          payload.subtitleId,
+          payload.subtitleUrl,
+          payload.subtitleLabel,
+          payload.subtitleLanguage,
         );
 
         if (!result.ok) {
@@ -1114,6 +1532,8 @@ app.register(async (wsApp) => {
               action: payload.action,
               atTimeSec: payload.atTimeSec,
               videoId: payload.videoId,
+              subtitleId: payload.subtitleId,
+              subtitleUrl: payload.subtitleUrl,
               error: result.error,
             },
             "Playback action rejected",
@@ -1131,6 +1551,8 @@ app.register(async (wsApp) => {
               action: payload.action,
               atTimeSec: payload.atTimeSec,
               videoId: payload.videoId,
+              subtitleId: payload.subtitleId,
+              subtitleUrl: payload.subtitleUrl,
               playbackTime: playbackSummary(room.playback),
             },
             "Playback action ignored because state is unchanged",
@@ -1138,25 +1560,33 @@ app.register(async (wsApp) => {
           return;
         }
 
-        if (payload.action === "pause" && playbackBeforeAction.isPlaying) {
-          recentPauseByRoomUser.set(roomUserKey, nowMs());
-        } else if (payload.action !== "seek") {
-          recentPauseByRoomUser.delete(roomUserKey);
-        }
-
-        if (payload.action === "seek" && !room.playback.isPlaying) {
-          const pausedAtMs = recentPauseByRoomUser.get(roomUserKey);
-          if (
-            typeof pausedAtMs === "number" &&
-            nowMs() - pausedAtMs <= SEEK_PAUSE_NOISE_WINDOW_MS
-          ) {
-            room.playback = {
-              ...room.playback,
-              isPlaying: true,
-              lastUpdatedAtMs: nowMs(),
-            };
-            room.revision += 1;
+        if (
+          payload.action === "play" ||
+          payload.action === "pause" ||
+          payload.action === "seek"
+        ) {
+          if (payload.action === "pause" && playbackBeforeAction.isPlaying) {
+            recentPauseByRoomUser.set(roomUserKey, nowMs());
+          } else if (payload.action !== "seek") {
+            recentPauseByRoomUser.delete(roomUserKey);
           }
+
+          if (payload.action === "seek" && !room.playback.isPlaying) {
+            const pausedAtMs = recentPauseByRoomUser.get(roomUserKey);
+            if (
+              typeof pausedAtMs === "number" &&
+              nowMs() - pausedAtMs <= SEEK_PAUSE_NOISE_WINDOW_MS
+            ) {
+              room.playback = {
+                ...room.playback,
+                isPlaying: true,
+                lastUpdatedAtMs: nowMs(),
+              };
+              room.revision += 1;
+            }
+            recentPauseByRoomUser.delete(roomUserKey);
+          }
+        } else {
           recentPauseByRoomUser.delete(roomUserKey);
         }
 
@@ -1172,6 +1602,9 @@ app.register(async (wsApp) => {
                 ? Number((payload.atTimeSec / 60).toFixed(2))
                 : undefined,
             videoId: payload.videoId ?? room.playback.videoId,
+            subtitleId: payload.subtitleId,
+            subtitleUrl:
+              payload.subtitleUrl ?? room.playback.subtitle?.trackUrl,
             playbackTime: playbackSummary(room.playback),
             isPlaying: room.playback.isPlaying,
             revision: room.revision,
@@ -1188,7 +1621,34 @@ app.register(async (wsApp) => {
             "video_change",
             payload.action,
           );
-          broadcastRoomState(room, request, userId, "video_change", payload.action, socket);
+          broadcastRoomState(
+            room,
+            request,
+            userId,
+            "video_change",
+            payload.action,
+            socket,
+          );
+          return;
+        }
+
+        if (payload.action === "changeSubtitle") {
+          sendRoomStateToSocket(
+            socket,
+            room,
+            request,
+            userId,
+            "subtitle_change",
+            payload.action,
+          );
+          broadcastRoomState(
+            room,
+            request,
+            userId,
+            "subtitle_change",
+            payload.action,
+            socket,
+          );
           return;
         }
 
@@ -1200,7 +1660,13 @@ app.register(async (wsApp) => {
           "playback",
           payload.action,
         );
-        enqueuePlaybackBurstEvent(room, request, userId, payload.action, socket);
+        enqueuePlaybackBurstEvent(
+          room,
+          request,
+          userId,
+          payload.action,
+          socket,
+        );
         return;
       }
 
@@ -1306,6 +1772,7 @@ app.register(async (wsApp) => {
 
 const start = async (): Promise<void> => {
   await fsp.mkdir(dataDir, { recursive: true });
+  await fsp.mkdir(subtitlesDir, { recursive: true });
 
   try {
     await app.listen({

@@ -15,10 +15,11 @@ This document explains how to use the backend API.
 ## Core Concepts
 
 - Videos are read from `./data` (or `DATA_DIR`).
+- Local subtitle files are read from `./data/subtitles` (`.vtt`, `.srt`).
 - A room is created from a selected `videoId`.
 - Join and real-time sync happen over WebSocket.
 - Playback state is server-authoritative.
-- Any joined user can control playback (`play`, `pause`, `seek`, `changeVideo`).
+- Any joined user can control playback (`play`, `pause`, `seek`, `changeVideo`, `changeSubtitle`).
 
 ## 1) Health Check
 
@@ -76,7 +77,77 @@ Possible errors:
 - `404 { "error": "video_not_found" }`
 - `416 { "error": "invalid_range" }` or `416 { "error": "range_not_satisfiable" }`
 
-## 4) Create Room From Video
+## 4) Subtitles (Soft-subs)
+
+### `GET /subtitles`
+
+Returns subtitle files from `DATA_DIR/subtitles` (`.vtt`, `.srt`).
+
+Response:
+
+```json
+{
+  "dataDir": "/absolute/path/to/data/subtitles",
+  "count": 1,
+  "subtitles": [
+    {
+      "id": "MTc0MzM0MDEwMDAwMC1hYmNkLXN1YnMudnR0",
+      "fileName": "1743340100000-abcd-subs.vtt",
+      "sizeBytes": 2048,
+      "modifiedAtMs": 1739720000000,
+      "format": "vtt",
+      "trackUrl": "http://localhost:3000/subtitles/MTc0MzM0MDEwMDAwMC1hYmNkLXN1YnMudnR0/track"
+    }
+  ]
+}
+```
+
+### `GET /subtitles/:subtitleId/track`
+
+- Returns a `text/vtt` subtitle track (soft-sub).
+- If source file is `.srt`, server converts it to WebVTT on the fly.
+
+Possible errors:
+
+- `404 { "error": "subtitle_not_found" }`
+
+### `POST /subtitles/upload`
+
+Upload subtitle content (base64) from a local file picker in clients.
+
+Body:
+
+```json
+{
+  "fileName": "my-subtitles.srt",
+  "contentBase64": "MQowMDowMDowMCwwMDAgLS0+IDAwOjAwOjAyLDAwMApIZWxsbwo="
+}
+```
+
+Response (`201`):
+
+```json
+{
+  "subtitle": {
+    "id": "MTc0MzM0MDEwMDAwMC1hYmNkLW15LXN1YnRpdGxlcy5zcnQ",
+    "fileName": "1743340100000-abcd-my-subtitles.srt",
+    "sizeBytes": 56,
+    "modifiedAtMs": 1739720000000,
+    "format": "srt",
+    "trackUrl": "http://localhost:3000/subtitles/MTc0MzM0MDEwMDAwMC1hYmNkLW15LXN1YnRpdGxlcy5zcnQ/track"
+  }
+}
+```
+
+Possible errors:
+
+- `400 { "error": "invalid_subtitle_file_name" }`
+- `400 { "error": "unsupported_subtitle_format" }`
+- `400 { "error": "missing_subtitle_content" }`
+- `400 { "error": "invalid_subtitle_content" }`
+- `413 { "error": "subtitle_too_large" }`
+
+## 5) Create Room From Video
 
 ### `POST /rooms/from-video`
 
@@ -106,7 +177,8 @@ Response (`201`):
     "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
     "playbackTimeSec": 0,
     "isPlaying": false,
-    "lastUpdatedAtMs": 1739720000000
+    "lastUpdatedAtMs": 1739720000000,
+    "subtitle": null
   }
 }
 ```
@@ -115,7 +187,7 @@ Possible errors:
 
 - `404 { "error": "video_not_found" }`
 
-## 5) Room WebSocket
+## 6) Room WebSocket
 
 ### `GET /rooms/:roomId/ws?userId=...&inviteToken=...&nickname=...`
 
@@ -144,7 +216,7 @@ Possible connection errors:
 - `invalid_invite_token`
 - `invalid_nickname`
 
-## 6) Leave Room
+## 7) Leave Room
 
 ### `POST /rooms/:roomId/leave`
 
@@ -177,7 +249,8 @@ Response (`200`):
       "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
       "playbackTimeSec": 44.2,
       "isPlaying": false,
-      "lastUpdatedAtMs": 1739720044200
+      "lastUpdatedAtMs": 1739720044200,
+      "subtitle": null
     }
   }
 }
@@ -189,7 +262,7 @@ Possible errors:
 - `403 { "error": "invalid_invite_token" }`
 - `404 { "error": "room_not_found" }`
 
-## 7) Client -> Server Messages
+## 8) Client -> Server Messages
 
 ### Playback action
 
@@ -209,6 +282,36 @@ Possible errors:
 { "type": "playback", "action": "changeVideo", "videoId": "YW5vdGhlci5tcDQ" }
 ```
 
+Set subtitle from local server-stored subtitle id:
+
+```json
+{
+  "type": "playback",
+  "action": "changeSubtitle",
+  "subtitleId": "MTc0MzM0MDEwMDAwMC1hYmNkLW15LXN1YnRpdGxlcy5zcnQ",
+  "subtitleLabel": "English",
+  "subtitleLanguage": "en"
+}
+```
+
+Set subtitle from external link:
+
+```json
+{
+  "type": "playback",
+  "action": "changeSubtitle",
+  "subtitleUrl": "https://example.com/subs/movie.vtt",
+  "subtitleLabel": "English CC",
+  "subtitleLanguage": "en"
+}
+```
+
+Clear subtitle:
+
+```json
+{ "type": "playback", "action": "changeSubtitle" }
+```
+
 Validation errors are returned as:
 
 ```json
@@ -220,6 +323,9 @@ Possible playback errors:
 - `invalid_seek_time`
 - `missing_video_id`
 - `video_not_found`
+- `subtitle_not_found`
+- `invalid_subtitle_url`
+- `ambiguous_subtitle_source`
 
 ### Update nickname
 
@@ -266,7 +372,7 @@ Possible error:
 { "type": "ping" }
 ```
 
-## 8) Server -> Client Messages
+## 9) Server -> Client Messages
 
 ### Welcome (sent once on connect)
 
@@ -289,7 +395,13 @@ Possible error:
       "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
       "playbackTimeSec": 42.3,
       "isPlaying": true,
-      "lastUpdatedAtMs": 1739720042300
+      "lastUpdatedAtMs": 1739720042300,
+      "subtitle": {
+        "source": "local",
+        "trackUrl": "/subtitles/MTc0MzM0MDEwMDAwMC1hYmNkLW15LXN1YnRpdGxlcy5zcnQ/track",
+        "label": "English",
+        "language": "en"
+      }
     }
   },
   "messages": []
@@ -321,7 +433,8 @@ Possible error:
       "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
       "playbackTimeSec": 44.2,
       "isPlaying": false,
-      "lastUpdatedAtMs": 1739720044200
+      "lastUpdatedAtMs": 1739720044200,
+      "subtitle": null
     }
   }
 }
@@ -335,6 +448,7 @@ Possible error:
 - `leave`
 - `playback`
 - `video_change`
+- `subtitle_change`
 - `sync`
 - `nickname_change`
 
