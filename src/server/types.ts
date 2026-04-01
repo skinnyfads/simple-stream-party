@@ -18,7 +18,9 @@ export type SubtitleState = {
 
 export type PlaybackState = {
   videoId: string;
-  videoUrl: string;
+  videoUrl?: string; // Kept for legacy compatibility if needed
+  hlsUrl?: string;
+  hlsStatus?: string;
   playbackTimeSec: number;
   isPlaying: boolean;
   lastUpdatedAtMs: number;

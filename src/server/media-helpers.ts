@@ -191,6 +191,56 @@ export const createMediaHelpers = (): MediaHelpers => {
     return sanitized || null;
   };
 
+  const hlsBaseDir = path.join(dataDir, "hls");
+
+  /**
+   * Discover videos from HLS directories (originals may have been deleted).
+   * Each HLS directory name is a videoId, which decodes to the original fileName.
+   */
+  const listHlsOnlyVideos = async (
+    excludeIds: Set<string>,
+  ): Promise<VideoItem[]> => {
+    let hlsEntries: fs.Dirent[];
+    try {
+      hlsEntries = await fsp.readdir(hlsBaseDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const videos: VideoItem[] = [];
+    for (const entry of hlsEntries) {
+      if (!entry.isDirectory() || excludeIds.has(entry.name)) {
+        continue;
+      }
+
+      const videoId = entry.name;
+      const originalFileName = fromVideoId(videoId);
+      if (!originalFileName) {
+        continue;
+      }
+
+      // Check playlist exists
+      const playlistPath = path.join(hlsBaseDir, videoId, "playlist.m3u8");
+      try {
+        const stat = await fsp.stat(playlistPath);
+        if (!stat.isFile()) {
+          continue;
+        }
+
+        videos.push({
+          id: videoId,
+          fileName: originalFileName,
+          sizeBytes: 0,
+          modifiedAtMs: stat.mtimeMs,
+          streamPath: streamPathForVideoId(videoId),
+        });
+      } catch {
+        continue;
+      }
+    }
+    return videos;
+  };
+
   const listVideos = async (): Promise<VideoItem[]> => {
     let entries: fs.Dirent[];
     try {
@@ -205,6 +255,7 @@ export const createMediaHelpers = (): MediaHelpers => {
 
     const files = entries.filter((entry) => entry.isFile());
     const videos: VideoItem[] = [];
+    const sourceVideoIds = new Set<string>();
 
     for (const file of files) {
       const ext = path.extname(file.name).toLowerCase();
@@ -215,6 +266,7 @@ export const createMediaHelpers = (): MediaHelpers => {
       const fullPath = path.join(dataDir, file.name);
       const stat = await fsp.stat(fullPath);
       const id = toVideoId(file.name);
+      sourceVideoIds.add(id);
 
       videos.push({
         id,
@@ -224,6 +276,10 @@ export const createMediaHelpers = (): MediaHelpers => {
         streamPath: streamPathForVideoId(id),
       });
     }
+
+    // Also discover videos that only exist as HLS (original deleted)
+    const hlsOnlyVideos = await listHlsOnlyVideos(sourceVideoIds);
+    videos.push(...hlsOnlyVideos);
 
     videos.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs);
     return videos;
@@ -246,26 +302,43 @@ export const createMediaHelpers = (): MediaHelpers => {
       return null;
     }
 
+    // Try source file first
     try {
       const stat = await fsp.stat(fullPath);
-      if (!stat.isFile()) {
-        return null;
+      if (stat.isFile()) {
+        return {
+          id: videoId,
+          fileName,
+          sizeBytes: stat.size,
+          modifiedAtMs: stat.mtimeMs,
+          streamPath: streamPathForVideoId(videoId),
+        };
       }
-
-      return {
-        id: videoId,
-        fileName,
-        sizeBytes: stat.size,
-        modifiedAtMs: stat.mtimeMs,
-        streamPath: streamPathForVideoId(videoId),
-      };
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
-      if (err.code === "ENOENT") {
-        return null;
+      if (err.code !== "ENOENT") {
+        throw error;
       }
-      throw error;
     }
+
+    // Source file gone — check if HLS directory exists
+    const playlistPath = path.join(hlsBaseDir, videoId, "playlist.m3u8");
+    try {
+      const stat = await fsp.stat(playlistPath);
+      if (stat.isFile()) {
+        return {
+          id: videoId,
+          fileName,
+          sizeBytes: 0,
+          modifiedAtMs: stat.mtimeMs,
+          streamPath: streamPathForVideoId(videoId),
+        };
+      }
+    } catch {
+      // No HLS either
+    }
+
+    return null;
   };
 
   const listSubtitles = async (): Promise<SubtitleItem[]> => {

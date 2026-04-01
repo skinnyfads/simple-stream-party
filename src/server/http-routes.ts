@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { ServerContext } from "./context.js";
 import type { Room, SubtitleItem } from "./types.js";
 
@@ -26,14 +26,15 @@ export const registerHttpRoutes = (
         fileName: video.fileName,
         sizeBytes: video.sizeBytes,
         modifiedAtMs: video.modifiedAtMs,
-        streamUrl: `${baseUrl}${video.streamPath}`,
+        hlsUrl: `${baseUrl}/videos/${video.id}/hls/playlist.m3u8`,
+        hlsStatus: context.hlsTranscoder.getStatus(video.id),
       })),
     };
   });
 
   app.get<{
     Params: { videoId: string };
-  }>("/videos/:videoId/stream", async (request, reply) => {
+  }>("/videos/:videoId/hls/status", async (request, reply) => {
     const { videoId } = request.params;
     const video = await context.getVideoById(videoId);
     if (!video) {
@@ -41,32 +42,76 @@ export const registerHttpRoutes = (
       return { error: "video_not_found" };
     }
 
-    const fullPath = path.join(context.dataDir, video.fileName);
-    const rangeHeader = request.headers.range;
-    const contentType = context.contentTypeForVideo(video.fileName);
+    return {
+      videoId,
+      status: context.hlsTranscoder.getStatus(videoId),
+    };
+  });
 
-    if (!rangeHeader) {
+  app.get<{
+    Params: { videoId: string; "*": string };
+  }>("/videos/:videoId/hls/*", async (request, reply) => {
+    const { videoId } = request.params;
+    const hlsFile = request.params["*"];
+
+    if (!hlsFile) {
+      reply.code(400);
+      return { error: "missing_hls_file" };
+    }
+
+    // Security: only allow .m3u8 and .ts files, no path traversal
+    const safeName = path.basename(hlsFile);
+    const ext = path.extname(safeName).toLowerCase();
+    if (ext !== ".m3u8" && ext !== ".ts") {
+      reply.code(400);
+      return { error: "invalid_hls_file_type" };
+    }
+
+    if (!context.hlsTranscoder.isReady(videoId)) {
+      reply.code(404);
+      return { error: "hls_not_ready" };
+    }
+
+    const hlsDir = context.hlsTranscoder.getHlsDir(videoId);
+    const fullPath = path.join(hlsDir, safeName);
+    const normalized = path.normalize(fullPath);
+    if (!normalized.startsWith(hlsDir + path.sep) && normalized !== hlsDir) {
+      reply.code(400);
+      return { error: "invalid_path" };
+    }
+
+    try {
+      const stat = await fsp.stat(fullPath);
+      if (!stat.isFile()) {
+        reply.code(404);
+        return { error: "file_not_found" };
+      }
+
+      const contentType =
+        ext === ".m3u8"
+          ? "application/vnd.apple.mpegurl"
+          : "video/mp2t";
+
       reply.header("Content-Type", contentType);
-      reply.header("Accept-Ranges", "bytes");
-      reply.header("Content-Length", video.sizeBytes.toString());
+      reply.header("Content-Length", stat.size.toString());
+
+      if (ext === ".ts") {
+        // Segments are immutable, cache aggressively
+        reply.header("Cache-Control", "public, max-age=31536000, immutable");
+      } else {
+        // Playlist should not be cached
+        reply.header("Cache-Control", "no-cache");
+      }
+
       return reply.send(fs.createReadStream(fullPath));
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === "ENOENT") {
+        reply.code(404);
+        return { error: "file_not_found" };
+      }
+      throw error;
     }
-
-    const range = context.parseSingleRange(rangeHeader, video.sizeBytes);
-    if (!range) {
-      reply.code(416);
-      reply.header("Content-Range", `bytes */${video.sizeBytes}`);
-      return { error: "invalid_range" };
-    }
-
-    const { start, end } = range;
-    const chunkSize = end - start + 1;
-    reply.code(206);
-    reply.header("Content-Type", contentType);
-    reply.header("Accept-Ranges", "bytes");
-    reply.header("Content-Length", chunkSize.toString());
-    reply.header("Content-Range", `bytes ${start}-${end}/${video.sizeBytes}`);
-    return reply.send(fs.createReadStream(fullPath, { start, end }));
   });
 
   app.get("/subtitles", async (request) => {
@@ -206,6 +251,7 @@ export const registerHttpRoutes = (
       playback: {
         videoId: video.id,
         videoUrl: video.streamPath,
+        hlsUrl: `/videos/${video.id}/hls/playlist.m3u8`,
         playbackTimeSec: 0,
         isPlaying: false,
         lastUpdatedAtMs: now,

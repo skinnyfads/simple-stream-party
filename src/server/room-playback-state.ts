@@ -521,6 +521,7 @@ export const createRoomPlaybackState = (
         room.playback = {
           videoId: video.id,
           videoUrl: video.streamPath,
+          hlsUrl: `/videos/${video.id}/hls/playlist.m3u8`,
           playbackTimeSec: 0,
           isPlaying: false,
           lastUpdatedAtMs: currentMs,

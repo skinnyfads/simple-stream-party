@@ -53,29 +53,38 @@ Response:
       "fileName": "example.mp4",
       "sizeBytes": 12582912,
       "modifiedAtMs": 1739720000000,
-      "streamUrl": "http://localhost:3000/videos/ZXhhbXBsZS5tcDQ/stream"
+      "hlsUrl": "http://localhost:3000/videos/ZXhhbXBsZS5tcDQ/hls/playlist.m3u8",
+      "hlsStatus": "ready"
     }
   ]
 }
 ```
 
-## 3) Stream Video
+## 3) HLS Streaming
 
-### `GET /videos/:videoId/stream`
+### `GET /videos/:videoId/hls/status`
 
-- Streams the selected file.
-- Supports `Range` header for seek/partial loading.
+- Returns the current transcoding status of the video (`pending`, `processing`, `ready`, `error`).
 
-Example:
+Example Response:
 
-```bash
-curl -H "Range: bytes=0-1023" http://localhost:3000/videos/ZXhhbXBsZS5tcDQ/stream
+```json
+{
+  "videoId": "ZXhhbXBsZS5tcDQ",
+  "status": "ready"
+}
 ```
+
+### `GET /videos/:videoId/hls/*`
+
+- Serves the `.m3u8` playlist and `.ts` video segments for HLS playback.
+- Segment files are cached aggressively; playlist files are not cached.
 
 Possible errors:
 
-- `404 { "error": "video_not_found" }`
-- `416 { "error": "invalid_range" }` or `416 { "error": "range_not_satisfiable" }`
+- `404 { "error": "hls_not_ready" }` if transcoding is not yet complete.
+- `404 { "error": "file_not_found" }`
+- `400 { "error": "invalid_hls_file_type" }`
 
 ## 4) Subtitles (Soft-subs)
 
@@ -175,6 +184,7 @@ Response (`201`):
   "playback": {
     "videoId": "ZXhhbXBsZS5tcDQ",
     "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
+    "hlsUrl": "/videos/ZXhhbXBsZS5tcDQ/hls/playlist.m3u8",
     "playbackTimeSec": 0,
     "isPlaying": false,
     "lastUpdatedAtMs": 1739720000000,
@@ -247,6 +257,7 @@ Response (`200`):
     "playback": {
       "videoId": "ZXhhbXBsZS5tcDQ",
       "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
+      "hlsUrl": "/videos/ZXhhbXBsZS5tcDQ/hls/playlist.m3u8",
       "playbackTimeSec": 44.2,
       "isPlaying": false,
       "lastUpdatedAtMs": 1739720044200,
@@ -393,6 +404,7 @@ Possible error:
     "playback": {
       "videoId": "ZXhhbXBsZS5tcDQ",
       "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
+      "hlsUrl": "/videos/ZXhhbXBsZS5tcDQ/hls/playlist.m3u8",
       "playbackTimeSec": 42.3,
       "isPlaying": true,
       "lastUpdatedAtMs": 1739720042300,
@@ -448,6 +460,7 @@ Possible error:
     "playback": {
       "videoId": "ZXhhbXBsZS5tcDQ",
       "videoUrl": "/videos/ZXhhbXBsZS5tcDQ/stream",
+      "hlsUrl": "/videos/ZXhhbXBsZS5tcDQ/hls/playlist.m3u8",
       "playbackTimeSec": 44.2,
       "isPlaying": false,
       "lastUpdatedAtMs": 1739720044200,
@@ -503,7 +516,7 @@ Playback actions (`play`, `pause`, `seek`, `changeVideo`) are not emitted as cha
 2. Call `POST /rooms/from-video` when a video is selected.
 3. Copy/share `shareUrl` (contains room id + token).
 4. Connect WebSocket to `/rooms/:roomId/ws?userId=...&inviteToken=...&nickname=...`.
-5. On `welcome`, load `room.playback.videoUrl` and initial message list.
+5. On `welcome`, load `room.playback.hlsUrl` (or poll `status` if processing) and initial message list.
 6. Send `playback` messages when the user interacts with player controls.
 7. Apply updates from `room_state` events.
 8. Send/receive chat through `chat` and `chat_message` events.

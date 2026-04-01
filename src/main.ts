@@ -30,6 +30,30 @@ const start = async (): Promise<void> => {
     app.log.error(error);
     process.exit(1);
   }
+
+  // Auto-transcode all videos to HLS after server starts
+  const videos = await context.listVideos();
+  if (videos.length > 0) {
+    app.log.info(`[hls] found ${videos.length} video(s), starting transcoding...`);
+    context.hlsTranscoder.transcodeAll(
+      videos.map((v) => ({ id: v.id, fileName: v.fileName })),
+      context.dataDir,
+      async (videoId, sourceFilePath) => {
+        const status = context.hlsTranscoder.getStatus(videoId);
+        if (status === "ready") {
+          try {
+            await fsp.unlink(sourceFilePath);
+            app.log.info(`[hls] deleted original: ${sourceFilePath}`);
+          } catch (err) {
+            const e = err as NodeJS.ErrnoException;
+            if (e.code !== "ENOENT") {
+              app.log.error(`[hls] failed to delete original: ${sourceFilePath} - ${e}`);
+            }
+          }
+        }
+      },
+    );
+  }
 };
 
 void start();

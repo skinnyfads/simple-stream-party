@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { DedupablePlaybackAction } from "../playback-dedupe.js";
+import { createHlsTranscoder, type HlsTranscoder } from "./hls-transcoder.js";
 import { createMediaHelpers } from "./media-helpers.js";
 import { createRoomPlaybackState } from "./room-playback-state.js";
 import type {
@@ -20,6 +21,7 @@ import type {
 } from "./types.js";
 
 export type ServerContext = {
+  hlsTranscoder: HlsTranscoder;
   rooms: Map<string, Room>;
   chatByRoom: Map<string, ChatMessage[]>;
   playbackActivitiesByRoom: Map<string, PlaybackActivity[]>;
@@ -116,6 +118,7 @@ export const createServerContext = (): ServerContext => {
   const newId = (): string => crypto.randomUUID();
 
   const media = createMediaHelpers();
+  const hlsTranscoder = createHlsTranscoder(media.dataDir);
   const roomPlayback = createRoomPlaybackState({
     nowMs,
     newId,
@@ -126,6 +129,7 @@ export const createServerContext = (): ServerContext => {
   });
 
   return {
+    hlsTranscoder,
     rooms: roomPlayback.rooms,
     chatByRoom: roomPlayback.chatByRoom,
     playbackActivitiesByRoom: roomPlayback.playbackActivitiesByRoom,
