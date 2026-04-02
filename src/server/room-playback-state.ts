@@ -3,6 +3,7 @@ import type {
   PlaybackBurstEvent,
 } from "../playback-dedupe.js";
 import { dedupePlaybackBurst } from "../playback-dedupe.js";
+import { isExternalVideoId, makeExternalVideoId } from "./external-video-id.js";
 import type {
   ChatMessage,
   MemberProfile,
@@ -90,6 +91,7 @@ export type RoomPlaybackState = {
     action: PlaybackAction,
     atTimeSec?: number,
     videoId?: string,
+    externalHlsUrl?: string,
     subtitleId?: string,
     subtitleUrl?: string,
     subtitleLabel?: string,
@@ -102,6 +104,7 @@ export type RoomPlaybackState = {
     action: PlaybackAction,
   ) => PlaybackActivity;
   listPlaybackActivities: (roomId: string) => PlaybackActivity[];
+  resolveExternalHlsUrl: (videoId: string) => string | null;
 };
 
 type CreateRoomPlaybackStateArgs = {
@@ -121,6 +124,7 @@ export const createRoomPlaybackState = (
   const rooms = new Map<string, Room>();
   const chatByRoom = new Map<string, ChatMessage[]>();
   const playbackActivitiesByRoom = new Map<string, PlaybackActivity[]>();
+  const externalHlsUrlByVideoId = new Map<string, string>();
   const socketsByRoom = new Map<string, Set<WsConnection>>();
   const socketUserByConnection = new WeakMap<WsConnection, string>();
   const pendingPlaybackBurstsByRoomUser = new Map<
@@ -194,6 +198,31 @@ export const createRoomPlaybackState = (
     try {
       const parsed = new URL(trimmed);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return null;
+      }
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  };
+
+  const normalizeExternalHlsUrl = (
+    value: string | undefined,
+  ): string | null => {
+    if (typeof value !== "string") {
+      return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return null;
+      }
+      if (!parsed.pathname.toLowerCase().endsWith(".m3u8")) {
         return null;
       }
       return parsed.toString();
@@ -462,6 +491,7 @@ export const createRoomPlaybackState = (
     action: PlaybackAction,
     atTimeSec?: number,
     videoId?: string,
+    externalHlsUrl?: string,
     subtitleId?: string,
     subtitleUrl?: string,
     subtitleLabel?: string,
@@ -508,26 +538,74 @@ export const createRoomPlaybackState = (
     }
 
     if (action === "changeVideo") {
-      if (!videoId) {
+      if (videoId && externalHlsUrl?.trim()) {
+        return { ok: false, error: "ambiguous_video_source" };
+      }
+
+      if (!videoId && !externalHlsUrl?.trim()) {
         return { ok: false, error: "missing_video_id" };
       }
 
-      const video = await args.getVideoById(videoId);
-      if (!video) {
-        return { ok: false, error: "video_not_found" };
-      }
+      if (videoId) {
+        const video = await args.getVideoById(videoId);
+        if (!video) {
+          return { ok: false, error: "video_not_found" };
+        }
 
-      if (playback.videoId !== video.id) {
-        room.playback = {
-          videoId: video.id,
-          videoUrl: video.streamPath,
-          hlsUrl: `/videos/${video.id}/hls/playlist.m3u8`,
-          playbackTimeSec: 0,
-          isPlaying: false,
-          lastUpdatedAtMs: currentMs,
-          subtitle: null,
-        };
-        changed = true;
+        if (playback.videoId !== video.id) {
+          room.playback = {
+            videoId: video.id,
+            videoUrl: video.streamPath,
+            hlsUrl: `/videos/${video.id}/hls/playlist.m3u8`,
+            hlsStatus: undefined,
+            playbackTimeSec: 0,
+            isPlaying: false,
+            lastUpdatedAtMs: currentMs,
+            subtitle: null,
+          };
+          changed = true;
+        }
+      } else {
+        const normalizedExternalHlsUrl =
+          normalizeExternalHlsUrl(externalHlsUrl);
+        if (!normalizedExternalHlsUrl) {
+          return { ok: false, error: "invalid_external_hls_url" };
+        }
+
+        const currentExternalHlsUrl = isExternalVideoId(playback.videoId)
+          ? externalHlsUrlByVideoId.get(playback.videoId)
+          : undefined;
+
+        let externalVideoId: string | undefined;
+        for (const [videoIdCandidate, mappedUrl] of externalHlsUrlByVideoId) {
+          if (mappedUrl === normalizedExternalHlsUrl) {
+            externalVideoId = videoIdCandidate;
+            break;
+          }
+        }
+        if (!externalVideoId) {
+          externalVideoId = makeExternalVideoId(args.newId());
+        }
+        externalHlsUrlByVideoId.set(externalVideoId, normalizedExternalHlsUrl);
+
+        if (
+          playback.videoId !== externalVideoId ||
+          currentExternalHlsUrl !== normalizedExternalHlsUrl ||
+          playback.hlsUrl !==
+            `/videos/${encodeURIComponent(externalVideoId)}/hls/playlist.m3u8`
+        ) {
+          room.playback = {
+            videoId: externalVideoId,
+            videoUrl: undefined,
+            hlsUrl: `/videos/${encodeURIComponent(externalVideoId)}/hls/playlist.m3u8`,
+            hlsStatus: "ready",
+            playbackTimeSec: 0,
+            isPlaying: false,
+            lastUpdatedAtMs: currentMs,
+            subtitle: null,
+          };
+          changed = true;
+        }
       }
     }
 
@@ -629,6 +707,9 @@ export const createRoomPlaybackState = (
     ...(playbackActivitiesByRoom.get(roomId) ?? []),
   ];
 
+  const resolveExternalHlsUrl = (videoId: string): string | null =>
+    externalHlsUrlByVideoId.get(videoId) ?? null;
+
   const periodicPlaybackSync = setInterval(() => {
     const currentMs = args.nowMs();
     for (const [roomId, roomSockets] of socketsByRoom.entries()) {
@@ -692,5 +773,6 @@ export const createRoomPlaybackState = (
     acquireControlLease,
     appendPlaybackActivity,
     listPlaybackActivities,
+    resolveExternalHlsUrl,
   };
 };

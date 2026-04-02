@@ -99,6 +99,7 @@ export type ServerContext = {
     action: PlaybackAction,
     atTimeSec?: number,
     videoId?: string,
+    externalHlsUrl?: string,
     subtitleId?: string,
     subtitleUrl?: string,
     subtitleLabel?: string,
@@ -111,6 +112,7 @@ export type ServerContext = {
     action: PlaybackAction,
   ) => PlaybackActivity;
   listPlaybackActivities: (roomId: string) => PlaybackActivity[];
+  resolveExternalHlsUrl: (videoId: string) => string | null;
 };
 
 export const createServerContext = (): ServerContext => {
@@ -174,5 +176,6 @@ export const createServerContext = (): ServerContext => {
     acquireControlLease: roomPlayback.acquireControlLease,
     appendPlaybackActivity: roomPlayback.appendPlaybackActivity,
     listPlaybackActivities: roomPlayback.listPlaybackActivities,
+    resolveExternalHlsUrl: roomPlayback.resolveExternalHlsUrl,
   };
 };

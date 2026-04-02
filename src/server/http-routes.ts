@@ -1,14 +1,18 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance } from "fastify";
 import type { ServerContext } from "./context.js";
+import { fromExternalVideoId, isExternalVideoId } from "./external-video-id.js";
+import { createExternalHlsProxy } from "./external-hls-proxy.js";
 import type { Room, SubtitleItem } from "./types.js";
 
 export const registerHttpRoutes = (
   app: FastifyInstance,
   context: ServerContext,
 ): void => {
+  const externalHlsProxy = createExternalHlsProxy();
+
   app.get("/health", async () => ({
     ok: true,
     service: "simple-stream-party",
@@ -36,6 +40,16 @@ export const registerHttpRoutes = (
     Params: { videoId: string };
   }>("/videos/:videoId/hls/status", async (request, reply) => {
     const { videoId } = request.params;
+    const externalPlaylistUrl = isExternalVideoId(videoId)
+      ? (context.resolveExternalHlsUrl(videoId) ?? fromExternalVideoId(videoId))
+      : null;
+    if (externalPlaylistUrl) {
+      return {
+        videoId,
+        status: "ready",
+      };
+    }
+
     const video = await context.getVideoById(videoId);
     if (!video) {
       reply.code(404);
@@ -49,6 +63,39 @@ export const registerHttpRoutes = (
   });
 
   app.get<{
+    Params: { videoId: string };
+    Querystring: { t?: string; s?: string };
+  }>("/videos/:videoId/hls/proxy", async (request, reply) => {
+    const { videoId } = request.params;
+    const { t, s } = request.query;
+
+    if (!isExternalVideoId(videoId)) {
+      reply.code(404);
+      return { error: "video_not_found" };
+    }
+
+    if (
+      !context.resolveExternalHlsUrl(videoId) &&
+      !fromExternalVideoId(videoId)
+    ) {
+      reply.code(404);
+      return { error: "video_not_found" };
+    }
+
+    try {
+      const proxied = await externalHlsProxy.fetchBySignedTarget(videoId, t, s);
+      reply.header("Content-Type", proxied.contentType);
+      reply.header("Content-Length", proxied.body.length.toString());
+      reply.header("Cache-Control", proxied.cacheControl);
+      return reply.send(proxied.body);
+    } catch (error) {
+      const err = error as { code?: string; statusCode?: number };
+      reply.code(err.statusCode ?? 502);
+      return { error: err.code ?? "upstream_request_failed" };
+    }
+  });
+
+  app.get<{
     Params: { videoId: string; "*": string };
   }>("/videos/:videoId/hls/*", async (request, reply) => {
     const { videoId } = request.params;
@@ -57,6 +104,30 @@ export const registerHttpRoutes = (
     if (!hlsFile) {
       reply.code(400);
       return { error: "missing_hls_file" };
+    }
+
+    const externalPlaylistUrl =
+      context.resolveExternalHlsUrl(videoId) ?? fromExternalVideoId(videoId);
+    if (externalPlaylistUrl) {
+      if (hlsFile !== "playlist.m3u8") {
+        reply.code(404);
+        return { error: "file_not_found" };
+      }
+
+      try {
+        const proxied = await externalHlsProxy.fetchAndRewritePlaylist(
+          videoId,
+          externalPlaylistUrl,
+        );
+        reply.header("Content-Type", proxied.contentType);
+        reply.header("Content-Length", proxied.body.length.toString());
+        reply.header("Cache-Control", proxied.cacheControl);
+        return reply.send(proxied.body);
+      } catch (error) {
+        const err = error as { code?: string; statusCode?: number };
+        reply.code(err.statusCode ?? 502);
+        return { error: err.code ?? "upstream_request_failed" };
+      }
     }
 
     // Security: only allow .m3u8 and .ts files, no path traversal
@@ -88,9 +159,7 @@ export const registerHttpRoutes = (
       }
 
       const contentType =
-        ext === ".m3u8"
-          ? "application/vnd.apple.mpegurl"
-          : "video/mp2t";
+        ext === ".m3u8" ? "application/vnd.apple.mpegurl" : "video/mp2t";
 
       reply.header("Content-Type", contentType);
       reply.header("Content-Length", stat.size.toString());

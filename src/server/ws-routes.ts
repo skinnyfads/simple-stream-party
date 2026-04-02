@@ -241,6 +241,7 @@ export const registerWsRoutes = (
             payload.action,
             payload.atTimeSec,
             payload.videoId,
+            payload.externalHlsUrl,
             payload.subtitleId,
             payload.subtitleUrl,
             payload.subtitleLabel,
@@ -256,6 +257,7 @@ export const registerWsRoutes = (
                 action: payload.action,
                 atTimeSec: payload.atTimeSec,
                 videoId: payload.videoId,
+                externalHlsUrl: payload.externalHlsUrl,
                 subtitleId: payload.subtitleId,
                 subtitleUrl: payload.subtitleUrl,
                 error: result.error,
@@ -275,6 +277,7 @@ export const registerWsRoutes = (
                 action: payload.action,
                 atTimeSec: payload.atTimeSec,
                 videoId: payload.videoId,
+                externalHlsUrl: payload.externalHlsUrl,
                 subtitleId: payload.subtitleId,
                 subtitleUrl: payload.subtitleUrl,
                 playbackTime: context.playbackSummary(room.playback),
@@ -326,6 +329,7 @@ export const registerWsRoutes = (
                   ? Number((payload.atTimeSec / 60).toFixed(2))
                   : undefined,
               videoId: payload.videoId ?? room.playback.videoId,
+              externalHlsUrl: payload.externalHlsUrl ?? room.playback.hlsUrl,
               subtitleId: payload.subtitleId,
               subtitleUrl:
                 payload.subtitleUrl ?? room.playback.subtitle?.trackUrl,

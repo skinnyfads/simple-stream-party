@@ -79,12 +79,22 @@ Example Response:
 
 - Serves the `.m3u8` playlist and `.ts` video segments for HLS playback.
 - Segment files are cached aggressively; playlist files are not cached.
+- For external HLS sources (`externalHlsUrl`), this endpoint serves a rewritten
+  playlist from this server domain.
+
+### `GET /videos/:videoId/hls/proxy?t=...&s=...`
+
+- Internal pull-through proxy endpoint used by rewritten external playlists.
+- Clients typically do not call this directly.
 
 Possible errors:
 
 - `404 { "error": "hls_not_ready" }` if transcoding is not yet complete.
 - `404 { "error": "file_not_found" }`
 - `400 { "error": "invalid_hls_file_type" }`
+- `400 { "error": "invalid_proxy_target" }`
+- `403 { "error": "forbidden_proxy_target" }`
+- `502 { "error": "upstream_request_failed" }`
 
 ## 4) Subtitles (Soft-subs)
 
@@ -293,6 +303,17 @@ Possible errors:
 { "type": "playback", "action": "changeVideo", "videoId": "YW5vdGhlci5tcDQ" }
 ```
 
+Change to an external HLS playlist URL (server will proxy/mirror via its own
+HLS endpoints to avoid browser CORS issues):
+
+```json
+{
+  "type": "playback",
+  "action": "changeVideo",
+  "externalHlsUrl": "https://cdn.example.com/live/channel-a/playlist.m3u8"
+}
+```
+
 Set subtitle from local server-stored subtitle id:
 
 ```json
@@ -333,6 +354,8 @@ Possible playback errors:
 
 - `invalid_seek_time`
 - `missing_video_id`
+- `invalid_external_hls_url`
+- `ambiguous_video_source`
 - `video_not_found`
 - `subtitle_not_found`
 - `invalid_subtitle_url`
@@ -527,3 +550,5 @@ Playback actions (`play`, `pause`, `seek`, `changeVideo`) are not emitted as cha
 
 - Storage is in-memory for rooms/chat; data resets on restart.
 - Sync transport uses WebSocket.
+- For `changeVideo` with `externalHlsUrl`, this server proxies external
+  playlists/segments and serves rewritten URLs from this server domain.

@@ -100,6 +100,7 @@ export type WsClientMessage =
       action: PlaybackAction;
       atTimeSec?: number;
       videoId?: string;
+      externalHlsUrl?: string;
       subtitleId?: string;
       subtitleUrl?: string;
       subtitleLabel?: string;
