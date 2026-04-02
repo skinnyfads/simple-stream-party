@@ -12,5 +12,6 @@ FROM base AS prod-deps
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --prod --frozen-lockfile
 
 FROM base
+RUN apk add --no-cache ffmpeg
 COPY --from=prod-deps /app/node_modules /app/node_modules
 CMD [ "pnpm", "start" ]
