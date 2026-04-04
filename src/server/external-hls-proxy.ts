@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
+import dns from "node:dns/promises";
 import net from "node:net";
+import env from "../env.js";
 
 type CachedResponse = {
   body: Buffer;
@@ -43,48 +45,104 @@ const SEGMENT_TTL_MS = 60_000;
 const MAX_CACHE_ENTRIES = 512;
 const MAX_CACHE_TOTAL_BYTES = 128 * 1024 * 1024;
 const MAX_CACHE_ENTRY_BYTES = 16 * 1024 * 1024;
+const MAX_REDIRECT_HOPS = 3;
+const UPSTREAM_FETCH_TIMEOUT_MS = 10_000;
 
 const isPlaylistContentType = (value: string): boolean =>
   /mpegurl|vnd\.apple\.mpegurl|x-mpegurl/i.test(value);
 
-const isPrivateIpAddress = (host: string): boolean => {
-  if (net.isIP(host) === 4) {
-    const [a, b] = host.split(".").map((part) => Number(part));
-    if (a === 10 || a === 127 || a === 0) {
-      return true;
-    }
-    if (a === 169 && b === 254) {
-      return true;
-    }
-    if (a === 172 && b >= 16 && b <= 31) {
-      return true;
-    }
-    if (a === 192 && b === 168) {
-      return true;
-    }
-    return false;
-  }
+type AllowedHostRule =
+  | { kind: "exact"; host: string }
+  | { kind: "subdomain"; suffix: string };
 
-  if (net.isIP(host) === 6) {
-    const lower = host.toLowerCase();
-    if (
-      lower === "::1" ||
-      lower.startsWith("fc") ||
-      lower.startsWith("fd") ||
-      lower.startsWith("fe8") ||
-      lower.startsWith("fe9") ||
-      lower.startsWith("fea") ||
-      lower.startsWith("feb")
-    ) {
-      return true;
-    }
-  }
+const FORBIDDEN_IP_BLOCKLIST = new net.BlockList();
+FORBIDDEN_IP_BLOCKLIST.addSubnet("0.0.0.0", 8, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("10.0.0.0", 8, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("100.64.0.0", 10, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("127.0.0.0", 8, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("169.254.0.0", 16, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("172.16.0.0", 12, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("192.0.0.0", 24, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("192.0.2.0", 24, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("192.168.0.0", 16, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("198.18.0.0", 15, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("198.51.100.0", 24, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("203.0.113.0", 24, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("224.0.0.0", 4, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("240.0.0.0", 4, "ipv4");
+FORBIDDEN_IP_BLOCKLIST.addAddress("255.255.255.255", "ipv4");
 
+FORBIDDEN_IP_BLOCKLIST.addAddress("::", "ipv6");
+FORBIDDEN_IP_BLOCKLIST.addAddress("::1", "ipv6");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("fc00::", 7, "ipv6");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("fe80::", 10, "ipv6");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("ff00::", 8, "ipv6");
+FORBIDDEN_IP_BLOCKLIST.addSubnet("2001:db8::", 32, "ipv6");
+
+const normalizeHostname = (hostname: string): string =>
+  hostname.trim().toLowerCase().replace(/\.+$/, "");
+
+const parseAllowedHostRules = (value: string): AllowedHostRule[] =>
+  value
+    .split(",")
+    .map((host) => normalizeHostname(host))
+    .filter((host) => host.length > 0)
+    .map((host) => {
+      if (host.startsWith("*.")) {
+        const suffix = host.slice(1);
+        if (suffix.length > 1) {
+          return { kind: "subdomain", suffix } satisfies AllowedHostRule;
+        }
+      }
+      return { kind: "exact", host } satisfies AllowedHostRule;
+    });
+
+const allowedHostRules = parseAllowedHostRules(env.EXTERNAL_HLS_ALLOWED_HOSTS);
+
+const isForbiddenIpAddress = (host: string): boolean => {
+  const ipVersion = net.isIP(host);
+  if (ipVersion === 4) {
+    return FORBIDDEN_IP_BLOCKLIST.check(host, "ipv4");
+  }
+  if (ipVersion === 6) {
+    return FORBIDDEN_IP_BLOCKLIST.check(host, "ipv6");
+  }
   return false;
 };
 
+const isAllowedHostname = (hostname: string): boolean => {
+  if (allowedHostRules.length === 0) {
+    return false;
+  }
+
+  return allowedHostRules.some((rule) => {
+    if (rule.kind === "exact") {
+      return hostname === rule.host;
+    }
+    return hostname.endsWith(rule.suffix) && hostname.length > rule.suffix.length;
+  });
+};
+
+const resolvesToOnlyPublicIps = async (hostname: string): Promise<boolean> => {
+  const ipVersion = net.isIP(hostname);
+  if (ipVersion > 0) {
+    return !isForbiddenIpAddress(hostname);
+  }
+
+  try {
+    const records = await dns.lookup(hostname, { all: true, verbatim: true });
+    if (records.length === 0) {
+      return false;
+    }
+
+    return records.every((record) => !isForbiddenIpAddress(record.address));
+  } catch {
+    return false;
+  }
+};
+
 const isForbiddenHostname = (hostname: string): boolean => {
-  const lower = hostname.trim().toLowerCase();
+  const lower = normalizeHostname(hostname);
   if (!lower) {
     return true;
   }
@@ -94,7 +152,7 @@ const isForbiddenHostname = (hostname: string): boolean => {
   if (lower.endsWith(".local")) {
     return true;
   }
-  if (isPrivateIpAddress(lower)) {
+  if (isForbiddenIpAddress(lower)) {
     return true;
   }
   return false;
@@ -106,9 +164,12 @@ const parseAndValidateTargetUrl = (value: string): URL | null => {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return null;
     }
-    if (isForbiddenHostname(parsed.hostname)) {
+    const normalizedHost = normalizeHostname(parsed.hostname);
+    if (isForbiddenHostname(normalizedHost)) {
       return null;
     }
+    parsed.hostname = normalizedHost;
+    parsed.hash = "";
     return parsed;
   } catch {
     return null;
@@ -193,6 +254,87 @@ export const createExternalHlsProxy = (): ExternalHlsProxy => {
     }
   };
 
+  const assertSafeFetchTarget = async (targetUrl: URL): Promise<void> => {
+    if (!isAllowedHostname(targetUrl.hostname)) {
+      throw {
+        code: "forbidden_proxy_target",
+        statusCode: 403,
+      } satisfies ExternalHlsProxyError;
+    }
+
+    const hasOnlyPublicResolution = await resolvesToOnlyPublicIps(
+      targetUrl.hostname,
+    );
+    if (!hasOnlyPublicResolution) {
+      throw {
+        code: "forbidden_proxy_target",
+        statusCode: 403,
+      } satisfies ExternalHlsProxyError;
+    }
+  };
+
+  const fetchWithValidatedRedirects = async (
+    initialTarget: URL,
+  ): Promise<{ response: Response; finalTarget: URL }> => {
+    let currentTarget = initialTarget;
+
+    for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
+      await assertSafeFetchTarget(currentTarget);
+
+      let response: Response;
+      try {
+        response = await fetch(currentTarget.toString(), {
+          headers: {
+            "user-agent": "simple-stream-party/1.0",
+            accept: "*/*",
+          },
+          redirect: "manual",
+          signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS),
+        });
+      } catch {
+        throw {
+          code: "upstream_request_failed",
+          statusCode: 502,
+        } satisfies ExternalHlsProxyError;
+      }
+
+      if (
+        response.status !== 301 &&
+        response.status !== 302 &&
+        response.status !== 303 &&
+        response.status !== 307 &&
+        response.status !== 308
+      ) {
+        return { response, finalTarget: currentTarget };
+      }
+
+      const location = response.headers.get("location");
+      if (!location) {
+        throw {
+          code: "upstream_request_failed",
+          statusCode: 502,
+        } satisfies ExternalHlsProxyError;
+      }
+
+      const redirected = parseAndValidateTargetUrl(
+        new URL(location, currentTarget).toString(),
+      );
+      if (!redirected) {
+        throw {
+          code: "forbidden_proxy_target",
+          statusCode: 403,
+        } satisfies ExternalHlsProxyError;
+      }
+
+      currentTarget = redirected;
+    }
+
+    throw {
+      code: "upstream_request_failed",
+      statusCode: 502,
+    } satisfies ExternalHlsProxyError;
+  };
+
   const buildProxyUrl = (videoId: string, targetUrl: string): string => {
     const encodedTarget = toEncodedTarget(targetUrl);
     const signature = signTarget(targetUrl);
@@ -265,21 +407,8 @@ export const createExternalHlsProxy = (): ExternalHlsProxy => {
       };
     }
 
-    let response: Response;
-    try {
-      response = await fetch(validatedTarget.toString(), {
-        headers: {
-          "user-agent": "simple-stream-party/1.0",
-          accept: "*/*",
-        },
-        redirect: "follow",
-      });
-    } catch {
-      throw {
-        code: "upstream_request_failed",
-        statusCode: 502,
-      } satisfies ExternalHlsProxyError;
-    }
+    const { response, finalTarget } =
+      await fetchWithValidatedRedirects(validatedTarget);
 
     if (!response.ok) {
       throw {
@@ -296,7 +425,7 @@ export const createExternalHlsProxy = (): ExternalHlsProxy => {
     const upstreamContentType = response.headers.get("content-type") ?? "";
     const rawBody = Buffer.from(await response.arrayBuffer());
     const isPlaylist =
-      validatedTarget.pathname.toLowerCase().endsWith(".m3u8") ||
+      finalTarget.pathname.toLowerCase().endsWith(".m3u8") ||
       isPlaylistContentType(upstreamContentType);
 
     let body = rawBody;
@@ -307,7 +436,7 @@ export const createExternalHlsProxy = (): ExternalHlsProxy => {
     if (isPlaylist) {
       const rewritten = rewritePlaylist(
         rawBody.toString("utf8"),
-        targetUrl,
+        finalTarget.toString(),
         videoId,
       );
       body = Buffer.from(rewritten, "utf8");

@@ -8,6 +8,7 @@ const env = cleanEnv(process.env, {
   PORT: num({ default: 3000 }),
   DATA_DIR: str({ default: "data" }),
   PUBLIC_BASE_URL: str({ default: "" }),
+  EXTERNAL_HLS_ALLOWED_HOSTS: str({ default: "" }),
 });
 
 export default env;

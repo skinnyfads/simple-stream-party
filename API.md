@@ -11,6 +11,7 @@ This document explains how to use the backend API.
   - `PORT` (default: `3000`)
   - `DATA_DIR` (default: `data`)
   - `PUBLIC_BASE_URL` (optional, used for generated `shareUrl`)
+  - `EXTERNAL_HLS_ALLOWED_HOSTS` (required for external HLS proxy; comma-separated trusted hosts, supports `*.example.com`)
 
 ## Core Concepts
 
