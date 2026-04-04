@@ -82,6 +82,8 @@ Example Response:
 - Segment files are cached aggressively; playlist files are not cached.
 - For external HLS sources (`externalHlsUrl`), this endpoint serves a rewritten
   playlist from this server domain.
+- External HLS access is only allowed for server-issued `external-...` IDs that
+  exist in active room playback state. Client-crafted legacy IDs are rejected.
 
 ### `GET /videos/:videoId/hls/proxy?t=...&s=...`
 

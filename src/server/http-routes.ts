@@ -3,7 +3,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { ServerContext } from "./context.js";
-import { fromExternalVideoId, isExternalVideoId } from "./external-video-id.js";
+import { isExternalVideoId } from "./external-video-id.js";
 import { createExternalHlsProxy } from "./external-hls-proxy.js";
 import type { Room, SubtitleItem } from "./types.js";
 
@@ -40,10 +40,12 @@ export const registerHttpRoutes = (
     Params: { videoId: string };
   }>("/videos/:videoId/hls/status", async (request, reply) => {
     const { videoId } = request.params;
-    const externalPlaylistUrl = isExternalVideoId(videoId)
-      ? (context.resolveExternalHlsUrl(videoId) ?? fromExternalVideoId(videoId))
-      : null;
-    if (externalPlaylistUrl) {
+    const externalPlaylistUrl = context.resolveExternalHlsUrl(videoId);
+    if (isExternalVideoId(videoId)) {
+      if (!externalPlaylistUrl) {
+        reply.code(404);
+        return { error: "video_not_found" };
+      }
       return {
         videoId,
         status: "ready",
@@ -74,10 +76,7 @@ export const registerHttpRoutes = (
       return { error: "video_not_found" };
     }
 
-    if (
-      !context.resolveExternalHlsUrl(videoId) &&
-      !fromExternalVideoId(videoId)
-    ) {
+    if (!context.resolveExternalHlsUrl(videoId)) {
       reply.code(404);
       return { error: "video_not_found" };
     }
@@ -106,8 +105,12 @@ export const registerHttpRoutes = (
       return { error: "missing_hls_file" };
     }
 
-    const externalPlaylistUrl =
-      context.resolveExternalHlsUrl(videoId) ?? fromExternalVideoId(videoId);
+    const externalPlaylistUrl = context.resolveExternalHlsUrl(videoId);
+    if (isExternalVideoId(videoId) && !externalPlaylistUrl) {
+      reply.code(404);
+      return { error: "video_not_found" };
+    }
+
     if (externalPlaylistUrl) {
       if (hlsFile !== "playlist.m3u8") {
         reply.code(404);
