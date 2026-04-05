@@ -112,6 +112,10 @@ export type WsClientMessage =
       replyToMessageId?: string;
     }
   | {
+      type: "chat_delete";
+      messageId: string;
+    }
+  | {
       type: "sync";
     }
   | {
@@ -162,6 +166,12 @@ export type WsServerMessage =
       type: "chat_message";
       message: ChatMessage;
       revision: number;
+    }
+  | {
+      type: "chat_message_deleted";
+      messageId: string;
+      revision: number;
+      deletedByUserId: string;
     }
   | {
       type: "pong";

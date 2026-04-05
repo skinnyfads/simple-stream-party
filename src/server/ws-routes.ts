@@ -399,6 +399,60 @@ export const registerWsRoutes = (
           return;
         }
 
+        if (payload.type === "chat_delete") {
+          const messageId =
+            typeof payload.messageId === "string"
+              ? payload.messageId.trim()
+              : "";
+          if (!messageId) {
+            context.sendWs(socket, {
+              type: "error",
+              error: "invalid_message_id",
+            });
+            return;
+          }
+
+          const roomMessages = context.chatByRoom.get(room.id) ?? [];
+          const messageIndex = roomMessages.findIndex(
+            (message) => message.id === messageId,
+          );
+          if (messageIndex < 0) {
+            context.sendWs(socket, {
+              type: "error",
+              error: "message_not_found",
+            });
+            return;
+          }
+
+          const existingMessage = roomMessages[messageIndex];
+          if (existingMessage.userId !== userId) {
+            context.sendWs(socket, {
+              type: "error",
+              error: "cannot_delete_other_user_message",
+            });
+            return;
+          }
+
+          roomMessages.splice(messageIndex, 1);
+          context.chatByRoom.set(room.id, roomMessages);
+          room.revision += 1;
+
+          const roomSocketsForChat = context.socketsByRoom.get(room.id);
+          if (!roomSocketsForChat) {
+            return;
+          }
+
+          for (const ws of roomSocketsForChat) {
+            context.sendWs(ws, {
+              type: "chat_message_deleted",
+              messageId,
+              revision: room.revision,
+              deletedByUserId: userId,
+            });
+          }
+          return;
+        }
+
         if (payload.type === "chat") {
           const trimmed = payload.message.trim();
           if (!trimmed) {

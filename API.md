@@ -397,6 +397,18 @@ Possible error:
 - `invalid_reply_message_id`
 - `reply_message_not_found`
 
+### Delete own chat message
+
+```json
+{ "type": "chat_delete", "messageId": "e15f7ab7-a54a-4f24-a7b8-001122334455" }
+```
+
+Possible errors:
+
+- `invalid_message_id`
+- `message_not_found`
+- `cannot_delete_other_user_message`
+
 ### Manual sync request
 
 ```json
@@ -530,6 +542,17 @@ Possible error:
 `userDisplayName` is optional.
 Playback actions (`play`, `pause`, `seek`, `changeVideo`) are not emitted as chat messages; they are delivered via `room_state` updates.
 
+### Chat delete event
+
+```json
+{
+  "type": "chat_message_deleted",
+  "messageId": "e15f7ab7-a54a-4f24-a7b8-001122334455",
+  "revision": 9,
+  "deletedByUserId": "bob"
+}
+```
+
 ### Pong
 
 ```json
@@ -545,7 +568,7 @@ Playback actions (`play`, `pause`, `seek`, `changeVideo`) are not emitted as cha
 5. On `welcome`, load `room.playback.hlsUrl` (or poll `status` if processing) and initial message list.
 6. Send `playback` messages when the user interacts with player controls.
 7. Apply updates from `room_state` events.
-8. Send/receive chat through `chat` and `chat_message` events.
+8. Send/receive chat through `chat`/`chat_delete` and `chat_message`/`chat_message_deleted` events.
 9. Send `profile:setNickname` when user updates display name.
 10. When a user leaves intentionally, call `POST /rooms/:roomId/leave`.
 
