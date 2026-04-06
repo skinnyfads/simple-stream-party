@@ -20,7 +20,9 @@ type ProxyResponse = {
 type ExternalHlsProxyErrorCode =
   | "invalid_proxy_target"
   | "forbidden_proxy_target"
-  | "upstream_request_failed";
+  | "upstream_request_failed"
+  | "upstream_response_too_large"
+  | "proxy_overloaded";
 
 type ExternalHlsProxyError = {
   code: ExternalHlsProxyErrorCode;
@@ -47,6 +49,9 @@ const MAX_CACHE_TOTAL_BYTES = 128 * 1024 * 1024;
 const MAX_CACHE_ENTRY_BYTES = 16 * 1024 * 1024;
 const MAX_REDIRECT_HOPS = 3;
 const UPSTREAM_FETCH_TIMEOUT_MS = 10_000;
+const MAX_CONCURRENT_UPSTREAM_FETCHES = 16;
+const MAX_UPSTREAM_PLAYLIST_BYTES = 1 * 1024 * 1024;
+const MAX_UPSTREAM_SEGMENT_BYTES = MAX_CACHE_ENTRY_BYTES;
 
 const isPlaylistContentType = (value: string): boolean =>
   /mpegurl|vnd\.apple\.mpegurl|x-mpegurl/i.test(value);
@@ -176,6 +181,19 @@ const parseAndValidateTargetUrl = (value: string): URL | null => {
   }
 };
 
+const isExternalHlsProxyError = (
+  value: unknown,
+): value is ExternalHlsProxyError => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<ExternalHlsProxyError>;
+  return (
+    typeof candidate.code === "string" && typeof candidate.statusCode === "number"
+  );
+};
+
 const toEncodedTarget = (targetUrl: string): string =>
   Buffer.from(targetUrl, "utf8").toString("base64url");
 
@@ -192,6 +210,7 @@ export const createExternalHlsProxy = (): ExternalHlsProxy => {
   const signingSecret = crypto.randomBytes(32);
   const cacheByTargetUrl = new Map<string, CachedResponse>();
   let cacheTotalBytes = 0;
+  let inFlightUpstreamFetches = 0;
 
   const signTarget = (targetUrl: string): string =>
     crypto
@@ -335,6 +354,73 @@ export const createExternalHlsProxy = (): ExternalHlsProxy => {
     } satisfies ExternalHlsProxyError;
   };
 
+  const acquireUpstreamFetchSlot = (): (() => void) => {
+    if (inFlightUpstreamFetches >= MAX_CONCURRENT_UPSTREAM_FETCHES) {
+      throw {
+        code: "proxy_overloaded",
+        statusCode: 503,
+      } satisfies ExternalHlsProxyError;
+    }
+
+    inFlightUpstreamFetches += 1;
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      inFlightUpstreamFetches -= 1;
+    };
+  };
+
+  const readResponseBodyWithLimit = async (
+    response: Response,
+    maxBytes: number,
+  ): Promise<Buffer> => {
+    const stream = response.body;
+    if (!stream) {
+      return Buffer.alloc(0);
+    }
+
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        if (!value || value.byteLength === 0) {
+          continue;
+        }
+
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          void reader.cancel().catch(() => undefined);
+          throw {
+            code: "upstream_response_too_large",
+            statusCode: 502,
+          } satisfies ExternalHlsProxyError;
+        }
+
+        chunks.push(Buffer.from(value));
+      }
+    } catch (error) {
+      if (isExternalHlsProxyError(error)) {
+        throw error;
+      }
+      throw {
+        code: "upstream_request_failed",
+        statusCode: 502,
+      } satisfies ExternalHlsProxyError;
+    }
+
+    return Buffer.concat(chunks, totalBytes);
+  };
+
   const buildProxyUrl = (videoId: string, targetUrl: string): string => {
     const encodedTarget = toEncodedTarget(targetUrl);
     const signature = signTarget(targetUrl);
@@ -407,51 +493,83 @@ export const createExternalHlsProxy = (): ExternalHlsProxy => {
       };
     }
 
-    const { response, finalTarget } =
-      await fetchWithValidatedRedirects(validatedTarget);
+    const releaseSlot = acquireUpstreamFetchSlot();
+    try {
+      const { response, finalTarget } =
+        await fetchWithValidatedRedirects(validatedTarget);
 
-    if (!response.ok) {
-      throw {
-        code: "upstream_request_failed",
-        statusCode:
-          response.status === 404
-            ? 404
-            : response.status >= 400 && response.status < 500
-              ? 502
-              : 502,
-      } satisfies ExternalHlsProxyError;
+      if (!response.ok) {
+        throw {
+          code: "upstream_request_failed",
+          statusCode:
+            response.status === 404
+              ? 404
+              : response.status >= 400 && response.status < 500
+                ? 502
+                : 502,
+        } satisfies ExternalHlsProxyError;
+      }
+
+      const upstreamContentType = response.headers.get("content-type") ?? "";
+      const isPlaylist =
+        finalTarget.pathname.toLowerCase().endsWith(".m3u8") ||
+        isPlaylistContentType(upstreamContentType);
+      const maxBytes = isPlaylist
+        ? MAX_UPSTREAM_PLAYLIST_BYTES
+        : MAX_UPSTREAM_SEGMENT_BYTES;
+
+      const declaredContentLengthHeader = response.headers.get("content-length");
+      if (declaredContentLengthHeader) {
+        const declaredContentLength = Number.parseInt(
+          declaredContentLengthHeader,
+          10,
+        );
+        if (
+          Number.isFinite(declaredContentLength) &&
+          declaredContentLength > maxBytes
+        ) {
+          throw {
+            code: "upstream_response_too_large",
+            statusCode: 502,
+          } satisfies ExternalHlsProxyError;
+        }
+      }
+
+      const rawBody = await readResponseBodyWithLimit(response, maxBytes);
+
+      let body = rawBody;
+      let contentType = upstreamContentType || "application/octet-stream";
+      let cacheControl = "public, max-age=60";
+      let ttlMs = SEGMENT_TTL_MS;
+
+      if (isPlaylist) {
+        const rewritten = rewritePlaylist(
+          rawBody.toString("utf8"),
+          finalTarget.toString(),
+          videoId,
+        );
+        body = Buffer.from(rewritten, "utf8");
+        if (body.length > MAX_UPSTREAM_PLAYLIST_BYTES) {
+          throw {
+            code: "upstream_response_too_large",
+            statusCode: 502,
+          } satisfies ExternalHlsProxyError;
+        }
+        contentType = "application/vnd.apple.mpegurl";
+        cacheControl = "no-cache";
+        ttlMs = PLAYLIST_TTL_MS;
+      }
+
+      const proxiedResponse: ProxyResponse = {
+        body,
+        contentType,
+        cacheControl,
+      };
+      setCached(validatedTarget.toString(), proxiedResponse, ttlMs);
+      return proxiedResponse;
+    } finally {
+      releaseSlot();
     }
-
-    const upstreamContentType = response.headers.get("content-type") ?? "";
-    const rawBody = Buffer.from(await response.arrayBuffer());
-    const isPlaylist =
-      finalTarget.pathname.toLowerCase().endsWith(".m3u8") ||
-      isPlaylistContentType(upstreamContentType);
-
-    let body = rawBody;
-    let contentType = upstreamContentType || "application/octet-stream";
-    let cacheControl = "public, max-age=60";
-    let ttlMs = SEGMENT_TTL_MS;
-
-    if (isPlaylist) {
-      const rewritten = rewritePlaylist(
-        rawBody.toString("utf8"),
-        finalTarget.toString(),
-        videoId,
-      );
-      body = Buffer.from(rewritten, "utf8");
-      contentType = "application/vnd.apple.mpegurl";
-      cacheControl = "no-cache";
-      ttlMs = PLAYLIST_TTL_MS;
-    }
-
-    const proxiedResponse: ProxyResponse = {
-      body,
-      contentType,
-      cacheControl,
-    };
-    setCached(validatedTarget.toString(), proxiedResponse, ttlMs);
-    return proxiedResponse;
   };
 
   const fetchAndRewritePlaylist = async (
